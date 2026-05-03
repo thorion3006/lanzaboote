@@ -23,40 +23,48 @@ let
   ++ cfg.extraEfiSysMountPoints;
 
   mkInstallCommand = efiSysMountPoint: ''
-    profDir="/nix/var/nix/profiles"
-    set --
+        profDir="/nix/var/nix/profiles"
+        set --
 
-    for profile in "$profDir"/system-*-link; do
-      if [ -L "$profile" ]; then
-        set -- "$@" "$profile"
-      fi
-    done
+        for profile in "$profDir"/system-*-link; do
+          if [ -L "$profile" ]; then
+            set -- "$@" "$profile"
+          fi
+        done
 
-    if [ -d "$profDir/system-profiles" ]; then
-      for profile in "$profDir"/system-profiles/*-*-link; do
-        if [ -L "$profile" ]; then
-          set -- "$@" "$profile"
+        if [ -d "$profDir/system-profiles" ]; then
+          for profile in "$profDir"/system-profiles/*-*-link; do
+            if [ -L "$profile" ]; then
+              set -- "$@" "$profile"
+            fi
+          done
         fi
-      done
-    fi
 
-    if [ "$#" -eq 0 ]; then
-      ${lib.getExe' pkgs.coreutils "printf"} "%s %s %s\n" \
-        "Failed to find usable system profiles. Please make sure that" \
-        "system profiles are present under $profDir/system-*-link and/or" \
-        "$profDir/system-profiles/<profile-name>-*-link." 1>&2
-      exit 1
-    fi
+        if [ "$#" -eq 0 ]; then
+          ${lib.getExe' pkgs.coreutils "printf"} "%s %s %s\n" \
+            "Failed to find usable system profiles. Please make sure that" \
+            "system profiles are present under $profDir/system-*-link and/or" \
+            "$profDir/system-profiles/<profile-name>-*-link." 1>&2
+          exit 1
+        fi
 
-    PATH=${config.systemd.package}/lib/systemd:$PATH
-    ${cfg.installCommand} \
-      --public-key ${lib.escapeShellArg (toString cfg.publicKeyFile)} \
-      --private-key ${lib.escapeShellArg (toString cfg.privateKeyFile)} \
-      ${lib.optionalString (
-        cfg.measuredBoot.enable && pcr 4
-      ) "--pcrlock-directory ${lib.escapeShellArg (toString cfg.measuredBoot.pcrlockDirectory)} \\"}
-      ${lib.escapeShellArg efiSysMountPoint} \
-      "$@"
+        PATH=${config.systemd.package}/lib/systemd:$PATH
+        ${cfg.installCommand} \
+    ${lib.concatStringsSep " \\\n" (
+      map (arg: "      " + arg) (
+        [
+          "--public-key ${lib.escapeShellArg (toString cfg.publicKeyFile)}"
+          "--private-key ${lib.escapeShellArg (toString cfg.privateKeyFile)}"
+        ]
+        ++ lib.optionals (cfg.measuredBoot.enable && pcr 4) [
+          "--pcrlock-directory ${lib.escapeShellArg (toString cfg.measuredBoot.pcrlockDirectory)}"
+        ]
+        ++ [
+          "${lib.escapeShellArg efiSysMountPoint}"
+          ''"$@"''
+        ]
+      )
+    )}
   '';
 
   installHook = pkgs.writeShellScriptBin "lzbt" (

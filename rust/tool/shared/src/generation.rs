@@ -9,7 +9,7 @@ use bootspec::BootJson;
 use bootspec::BootSpec;
 use bootspec::SpecialisationName;
 use serde::Deserialize;
-use time::OffsetDateTime;
+use time::{Month, OffsetDateTime};
 
 pub type GenerationTime = OffsetDateTime;
 
@@ -191,6 +191,16 @@ impl Generation {
     pub fn version_tag(&self) -> String {
         format!("{}{}", self.version, self.describe_specialisation(),)
     }
+
+    /// Describe the generation with a sortable timestamp for boot menu ordering.
+    pub fn boot_menu_version(&self) -> String {
+        let build_time = self
+            .build_time
+            .map(format_generation_time)
+            .unwrap_or_else(|| String::from("00000000000000"));
+
+        format!("{build_time}-generation-{}", self.version_tag())
+    }
 }
 
 impl fmt::Display for Generation {
@@ -205,6 +215,36 @@ fn read_build_time(path: &Path) -> Result<GenerationTime> {
         i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
     )?;
     Ok(build_time)
+}
+
+fn format_generation_time(build_time: GenerationTime) -> String {
+    let (year, month, day) = build_time.to_calendar_date();
+    let clock = build_time.time();
+    format!(
+        "{year:04}{:02}{:02}{:02}{:02}{:02}",
+        month_to_u8(month),
+        day,
+        clock.hour(),
+        clock.minute(),
+        clock.second()
+    )
+}
+
+fn month_to_u8(month: Month) -> u8 {
+    match month {
+        Month::January => 1,
+        Month::February => 2,
+        Month::March => 3,
+        Month::April => 4,
+        Month::May => 5,
+        Month::June => 6,
+        Month::July => 7,
+        Month::August => 8,
+        Month::September => 9,
+        Month::October => 10,
+        Month::November => 11,
+        Month::December => 12,
+    }
 }
 
 /// A link pointing to a generation.

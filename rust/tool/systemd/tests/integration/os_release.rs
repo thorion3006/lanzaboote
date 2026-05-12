@@ -1,7 +1,9 @@
 use std::fs;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use expect_test::{Expect, expect};
+use lanzaboote_tool::os_release::OsRelease;
 use tempfile::tempdir;
 
 use crate::common;
@@ -30,7 +32,7 @@ fn generate_expected_os_release() -> Result<()> {
                 is_default_profile,
                 &toplevel,
             )?)?;
-            let os_release_section = pe_section(&stub_data, ".osrel")
+            let os_release_section = common::pe_section(&stub_data, ".osrel")
                 .context("Failed to read .osrelease PE section.")?
                 .to_owned();
 
@@ -44,7 +46,7 @@ fn generate_expected_os_release() -> Result<()> {
         expect![[r#"
             ID=lanzaboote
             PRETTY_NAME=LanzaOS (Generation 1, 1970-01-01)
-            VERSION_ID=Generation 1, 1970-01-01
+            VERSION_ID=19700101000000-generation-1
         "#]],
     )?;
 
@@ -54,7 +56,7 @@ fn generate_expected_os_release() -> Result<()> {
         expect![[r#"
             ID=lanzaboote
             PRETTY_NAME=LanzaOS [My W#@cky_Yet_L3g!t profile-name -3] (Generation 1, 1970-01-01)
-            VERSION_ID=Generation 1, 1970-01-01
+            VERSION_ID=19700101000000-generation-1
         "#]],
     )?;
 
@@ -64,24 +66,73 @@ fn generate_expected_os_release() -> Result<()> {
         expect![[r#"
             ID=lanzaboote
             PRETTY_NAME=LanzaOS [system] (Generation 1, 1970-01-01)
-            VERSION_ID=Generation 1, 1970-01-01
+            VERSION_ID=19700101000000-generation-1
         "#]],
     )?;
 
     Ok(())
 }
 
-fn pe_section<'a>(file_data: &'a [u8], section_name: &str) -> Option<&'a [u8]> {
-    let pe_binary = goblin::pe::PE::parse(file_data).ok()?;
+#[test]
+fn newer_profile_generation_gets_higher_version_id() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
 
-    pe_binary
-        .sections
-        .iter()
-        .find(|s| s.name().unwrap() == section_name)
-        .and_then(|s| {
-            let section_start: usize = s.pointer_to_raw_data.try_into().ok()?;
-            assert!(s.virtual_size <= s.size_of_raw_data);
-            let section_end: usize = section_start + usize::try_from(s.virtual_size).ok()?;
-            Some(&file_data[section_start..section_end])
-        })
+    let default_toplevel = common::setup_toplevel(tmpdir.path())?;
+    let default_generation =
+        common::setup_generation_link_from_toplevel(&default_toplevel, profiles.path(), 46, None)?;
+    common::set_generation_link_mtime(&default_generation, 0)?;
+
+    let comin_toplevel = common::setup_toplevel(tmpdir.path())?;
+    let comin_generation = common::setup_generation_link_from_toplevel(
+        &comin_toplevel,
+        profiles.path(),
+        1,
+        Some("comin"),
+    )?;
+    common::set_generation_link_mtime(&comin_generation, 10)?;
+
+    let output = common::lanzaboote_install(
+        0,
+        esp_mountpoint.path(),
+        vec![default_generation, comin_generation],
+    )?;
+    assert!(output.status.success());
+
+    let default_os_release =
+        os_release_for_image(&esp_mountpoint, 46, None, true, &default_toplevel)?;
+    let comin_os_release =
+        os_release_for_image(&esp_mountpoint, 1, Some("comin"), false, &comin_toplevel)?;
+
+    assert!(
+        default_os_release.0["VERSION_ID"] < comin_os_release.0["VERSION_ID"],
+        "{} should sort before {}",
+        default_os_release.0["VERSION_ID"],
+        comin_os_release.0["VERSION_ID"]
+    );
+
+    Ok(())
+}
+
+fn os_release_for_image(
+    esp: &tempfile::TempDir,
+    version: u64,
+    profile: Option<&str>,
+    is_default_profile: bool,
+    toplevel: &std::path::Path,
+) -> Result<OsRelease> {
+    let stub_data = fs::read(common::image_path(
+        esp,
+        version,
+        profile,
+        is_default_profile,
+        toplevel,
+    )?)?;
+    let os_release_section = common::pe_section(&stub_data, ".osrel")
+        .context("Failed to read .osrelease PE section.")?;
+    let os_release_section = std::str::from_utf8(os_release_section)?;
+    Ok(OsRelease::from_str(
+        os_release_section.trim_end_matches('\0'),
+    )?)
 }

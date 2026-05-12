@@ -168,7 +168,7 @@ fn keep_protected_boot() -> Result<()> {
 
     // Add a new generation
     generation_links.push(
-        common::setup_generation_link(tmpdir.path(), profiles.path(), 4)
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 4, None)
             .expect("Failed to setup generation link"),
     );
 

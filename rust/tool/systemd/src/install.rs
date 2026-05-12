@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::prelude::{OsStrExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::string::ToString;
 
 use anyhow::{Context, Result, anyhow};
@@ -114,10 +115,6 @@ impl<S: Signer> Installer<S> {
     pub fn install(&mut self) -> Result<()> {
         log::info!("Installing Lanzaboote to {:?}...", self.esp_paths.esp);
 
-        let links = self
-            .generation_links
-            .iter()
-            .map(GenerationLink::from_path)
         let links = self
             .generation_links
             .iter()
@@ -393,7 +390,15 @@ impl<S: Signer> Installer<S> {
 
         // An Err returned from this function means that we couldn't properly read
         // the different files belonging to this generation, so it should be reinstalled
-        if let Ok((stub_target, kernel_path, initrd_path)) = self.read_installed_generation(regex) {
+        if let Ok((stub_target, kernel_path, initrd_path, installed_os_release)) =
+            self.read_installed_generation(regex)
+        {
+            let expected_os_release = OsRelease::from_generation(generation)
+                .context("Failed to build expected OsRelease from generation.")?;
+            if installed_os_release != expected_os_release {
+                return Ok(false);
+            }
+
             self.gc_roots
                 .extend([&stub_target, &kernel_path, &initrd_path]);
             // Do not return yet, we still need to check the existence of the pcrlock measurements.
@@ -420,7 +425,10 @@ impl<S: Signer> Installer<S> {
     // The regex should only match a single generation on disk.
     // An Err returned from this function means that we couldn't properly read
     // the different files belonging to this generation, so it should be reinstalled
-    fn read_installed_generation(&mut self, regex: Regex) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    fn read_installed_generation(
+        &mut self,
+        regex: Regex,
+    ) -> Result<(PathBuf, PathBuf, PathBuf, OsRelease)> {
         // Read the esp dir and find the entry that corresponds to the generation.
         // There should only be one such entry.
         let stub_target = fs::read_dir(&self.esp_paths.linux)?
@@ -438,6 +446,12 @@ impl<S: Signer> Installer<S> {
 
         let stub = fs::read(&stub_target)
             .with_context(|| format!("Failed to read the stub: {}", stub_target.display()))?;
+        let os_release = pe::read_section_data(&stub, ".osrel").context("Missing os-release.")?;
+        let os_release = std::str::from_utf8(os_release)
+            .context("Failed to read os-release as UTF-8.")?
+            .trim_end_matches('\0');
+        let installed_os_release =
+            OsRelease::from_str(os_release).context("Failed to parse installed os-release.")?;
         let kernel_path = resolve_efi_path(
             &self.esp_paths.esp,
             pe::read_section_data(&stub, ".linux").context("Missing kernel path.")?,
@@ -451,7 +465,7 @@ impl<S: Signer> Installer<S> {
             anyhow::bail!("Missing kernel or initrd.");
         }
 
-        Ok((stub_target, kernel_path, initrd_path))
+        Ok((stub_target, kernel_path, initrd_path, installed_os_release))
     }
 
     /// Install a content-addressed file to the `EFI/nixos` directory on the ESP.
@@ -813,53 +827,6 @@ fn shell_quote(value: &OsStr) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-
-    use super::{profile_component_for_efi, shell_quote};
-
-    #[test]
-    fn profile_component_for_efi_is_stable() {
-        let component = profile_component_for_efi("Workstation-1_2.test");
-        assert_eq!(component, profile_component_for_efi("Workstation-1_2.test"));
-        assert_eq!(component.len(), 64);
-        assert!(
-            component
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        );
-    }
-
-    #[test]
-    fn profile_component_for_efi_distinguishes_case() {
-        assert_ne!(
-            profile_component_for_efi("Work"),
-            profile_component_for_efi("work")
-        );
-    }
-
-    #[test]
-    fn profile_component_for_efi_is_injective_for_escape_sequences() {
-        assert_ne!(
-            profile_component_for_efi("foo bar"),
-            profile_component_for_efi("foo~20bar")
-        );
-    }
-
-    #[test]
-    fn shell_quote_handles_spaces_and_single_quotes() {
-        assert_eq!(
-            shell_quote(OsStr::new("/tmp/profile name")),
-            "'/tmp/profile name'"
-        );
-        assert_eq!(
-            shell_quote(OsStr::new("/tmp/it's complicated")),
-            "'/tmp/it'\"'\"'s complicated'"
-        );
-    }
-}
-
 /// Install a PE file. The PE gets signed in the process.
 ///
 /// If the file already exists at the destination, it is overwritten.
@@ -959,5 +926,52 @@ fn set_permission_bits(path: &Path, permission_bits: u32) -> Result<()> {
 fn ensure_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::{profile_component_for_efi, shell_quote};
+
+    #[test]
+    fn profile_component_for_efi_is_stable() {
+        let component = profile_component_for_efi("Workstation-1_2.test");
+        assert_eq!(component, profile_component_for_efi("Workstation-1_2.test"));
+        assert_eq!(component.len(), 64);
+        assert!(
+            component
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn profile_component_for_efi_distinguishes_case() {
+        assert_ne!(
+            profile_component_for_efi("Work"),
+            profile_component_for_efi("work")
+        );
+    }
+
+    #[test]
+    fn profile_component_for_efi_is_injective_for_escape_sequences() {
+        assert_ne!(
+            profile_component_for_efi("foo bar"),
+            profile_component_for_efi("foo~20bar")
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_single_quotes() {
+        assert_eq!(
+            shell_quote(OsStr::new("/tmp/profile name")),
+            "'/tmp/profile name'"
+        );
+        assert_eq!(
+            shell_quote(OsStr::new("/tmp/it's complicated")),
+            "'/tmp/it'\"'\"'s complicated'"
+        );
     }
 }

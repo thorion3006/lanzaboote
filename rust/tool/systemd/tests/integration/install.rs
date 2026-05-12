@@ -1,6 +1,11 @@
-use anyhow::Result;
+use std::fs;
+use std::process::Command;
+use std::str::FromStr;
+
+use anyhow::{Context, Result};
 use base32ct::{Base32Unpadded, Encoding};
-use tempfile::tempdir;
+use lanzaboote_tool::os_release::OsRelease;
+use tempfile::{NamedTempFile, tempdir};
 
 use crate::common::{
     self, count_files, hash_file, remove_signature, setup_generation_link_from_toplevel,
@@ -190,4 +195,60 @@ fn keep_custom_system_profile_distinct_from_default_profile() -> Result<()> {
     assert_ne!(default_image, custom_image);
 
     Ok(())
+}
+
+#[test]
+fn rewrite_installed_generation_when_os_release_is_stale() -> Result<()> {
+    let esp = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let toplevel = common::setup_toplevel(tmpdir.path())?;
+
+    let generation_link = setup_generation_link_from_toplevel(&toplevel, profiles.path(), 1, None)?;
+    let image = common::image_path(&esp, 1, None, true, &toplevel)?;
+
+    let output1 = common::lanzaboote_install(0, esp.path(), vec![generation_link.clone()])?;
+    assert!(output1.status.success());
+    assert!(verify_signature(&image)?);
+
+    rewrite_os_release_section(
+        &image,
+        "ID=lanzaboote\nPRETTY_NAME=LanzaOS (Generation 1, 1970-01-01)\nVERSION_ID=Generation 1, 1970-01-01\n",
+    )?;
+    assert!(!verify_signature(&image)?);
+
+    let output2 = common::lanzaboote_install(0, esp.path(), vec![generation_link])?;
+    assert!(output2.status.success());
+    assert!(verify_signature(&image)?);
+
+    let os_release = read_os_release(&image)?;
+    assert_eq!(os_release.0["VERSION_ID"], "19700101000000-generation-1");
+
+    Ok(())
+}
+
+fn rewrite_os_release_section(image: &std::path::Path, contents: &str) -> Result<()> {
+    let os_release = NamedTempFile::new()?;
+    fs::write(os_release.path(), contents)?;
+
+    let rewritten = image.with_extension("efi.tmp");
+    let status = Command::new("objcopy")
+        .arg("--update-section")
+        .arg(format!(".osrel={}", os_release.path().display()))
+        .arg(image)
+        .arg(&rewritten)
+        .status()?;
+    assert!(status.success());
+
+    fs::rename(&rewritten, image)?;
+    Ok(())
+}
+
+fn read_os_release(image: &std::path::Path) -> Result<OsRelease> {
+    let file = fs::read(image)?;
+    let os_release_section =
+        common::pe_section(&file, ".osrel").context("Failed to read .osrelease PE section.")?;
+    Ok(OsRelease::from_str(
+        std::str::from_utf8(os_release_section)?.trim_end_matches('\0'),
+    )?)
 }

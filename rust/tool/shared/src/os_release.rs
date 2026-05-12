@@ -13,6 +13,7 @@ use crate::generation::Generation;
 /// The BTreeMap is used over a HashMap, so that the keys are ordered. This is irrelevant for
 /// systemd-boot (which does not care about order when reading the os-release file) but is useful
 /// for testing. Ordered keys allow using snapshot tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsRelease(pub BTreeMap<String, String>);
 
 impl OsRelease {
@@ -45,7 +46,7 @@ impl OsRelease {
             ),
         );
 
-        map.insert("VERSION_ID".into(), generation.describe());
+        map.insert("VERSION_ID".into(), generation.boot_menu_version());
 
         Ok(Self(map))
     }

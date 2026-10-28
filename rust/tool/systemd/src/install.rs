@@ -127,9 +127,9 @@ impl<S: Signer> Installer<S> {
             .and_then(|p| fs::canonicalize(p).ok())
             .and_then(|protected_system| {
                 log::info!("Protecting system {}", protected_system.display());
-                links.iter().find(|link| {
-                    fs::canonicalize(&link.path).is_ok_and(|resolved| resolved == protected_system)
-                })
+                links
+                    .iter()
+                    .find(|link| link_provides_toplevel(link, &protected_system))
             })
             .cloned();
 
@@ -222,6 +222,8 @@ impl<S: Signer> Installer<S> {
 
         // Keep the currently booted system bootable even if it falls outside of the
         // configuration limit, at the cost of dropping the oldest retained generation.
+        // With a configuration limit of one, dropping the oldest would remove the generation
+        // that was just built and could never be booted into, so both are kept instead.
         if let Some(booted_link) = booted_link
             && !generations.iter().any(|generation| {
                 generation.is_default_profile == booted_link.is_default_profile
@@ -230,7 +232,7 @@ impl<S: Signer> Installer<S> {
             })
             && let Ok(booted_generation) = Generation::from_link(booted_link)
         {
-            if !generations.is_empty() {
+            if generations.len() > 1 {
                 generations.remove(0);
             }
             generations.push(booted_generation);
@@ -830,6 +832,32 @@ fn measurement_name_from_parts(
     } else {
         format!("{}-{}", profile_component_for_efi(profile), version_tag)
     }
+}
+
+/// Whether the generation behind this link provides the protected system.
+///
+/// `/run/booted-system` points at the toplevel of whatever system was booted. When a
+/// specialisation was booted, that is the specialisation's toplevel rather than the parent
+/// toplevel the profile link points at, so the search also has to walk the generation's
+/// specialisations. A link whose bootspec cannot be read only matches directly; such
+/// generations are reported as broken, which disables garbage collection and protects them
+/// that way.
+fn link_provides_toplevel(link: &GenerationLink, protected_system: &Path) -> bool {
+    fs::canonicalize(&link.path).is_ok_and(|resolved| resolved == protected_system)
+        || Generation::from_link(link)
+            .is_ok_and(|generation| generation_provides_toplevel(&generation, protected_system))
+}
+
+fn generation_provides_toplevel(generation: &Generation, protected_system: &Path) -> bool {
+    let toplevel_matches = |toplevel: &Path| {
+        fs::canonicalize(toplevel).is_ok_and(|resolved| resolved == protected_system)
+    };
+
+    toplevel_matches(&generation.spec.bootspec.bootspec.toplevel.0)
+        || generation
+            .specialisations
+            .values()
+            .any(|specialisation| generation_provides_toplevel(specialisation, protected_system))
 }
 
 fn malformed_generation_hint(link: &GenerationLink) -> String {

@@ -135,6 +135,19 @@ fn find_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
     assert!(found.is_some_and(|e| e.is_ok()));
 }
 
+fn no_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
+    let found = fs::read_dir(path)
+        .expect("Directory doesn't exist")
+        .any(|entry| {
+            entry.is_ok_and(|e| {
+                e.path()
+                    .file_name()
+                    .is_some_and(|filename| filename.to_string_lossy().starts_with(prefix))
+            })
+        });
+    assert!(!found, "Unexpected stub with prefix {prefix}");
+}
+
 #[test]
 fn keep_protected_boot() -> Result<()> {
     let esp_mountpoint = tempdir()?;
@@ -192,6 +205,77 @@ fn keep_protected_boot() -> Result<()> {
     // Note how 2 is missing here
     find_file_with_prefix(&uki_dir, "nixos-generation-3");
     find_file_with_prefix(&uki_dir, "nixos-generation-4");
+
+    Ok(())
+}
+
+#[test]
+fn keep_protected_boot_when_booted_into_specialisation() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+
+    // Generation 1 has a specialisation pointing at its own toplevel, like real NixOS
+    // specialisations. When booted into it, /run/booted-system resolves to the
+    // specialisation's toplevel instead of the parent toplevel the profile link points at.
+    let parent_toplevel = common::setup_toplevel(tmpdir.path())?;
+    let specialisation_toplevel = common::setup_toplevel(tmpdir.path())?;
+    let booted = common::setup_generation_link_with_specialisation_toplevel(
+        &parent_toplevel,
+        &specialisation_toplevel,
+        profiles.path(),
+        1,
+        None,
+    )?;
+    let generation_links = vec![
+        booted,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2, None)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 3, None)?,
+    ];
+
+    let output = common::Lanzaboote::new()
+        .config_limit(2)
+        .protected_system(specialisation_toplevel)
+        .install(esp_mountpoint.path(), generation_links)?;
+    assert!(output.status.success());
+
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    // The booted specialisation's parent generation (and with it the specialisation entry)
+    // must survive the limit of 2...
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
+    find_file_with_prefix(&uki_dir, "nixos-generation-1-specialisation-rescue");
+    // ...at the cost of the middle generation.
+    no_file_with_prefix(&uki_dir, "nixos-generation-2");
+    find_file_with_prefix(&uki_dir, "nixos-generation-3");
+
+    Ok(())
+}
+
+#[test]
+fn keep_newest_generation_when_limit_is_one_and_booted_is_older() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let generation_links: Vec<PathBuf> = [1, 2, 3]
+        .into_iter()
+        .map(|v| {
+            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
+                .expect("Failed to setup generation link")
+        })
+        .collect();
+
+    let output = common::Lanzaboote::new()
+        .config_limit(1)
+        .protected_system(generation_links[0].clone())
+        .install(esp_mountpoint.path(), generation_links)?;
+    assert!(output.status.success());
+
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    // Both the booted generation and the generation that was just built must be bootable;
+    // only the middle generation is dropped.
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
+    no_file_with_prefix(&uki_dir, "nixos-generation-2");
+    find_file_with_prefix(&uki_dir, "nixos-generation-3");
 
     Ok(())
 }

@@ -71,7 +71,8 @@ pub struct Generation {
     pub is_default_profile: bool,
     /// Profile symlink index
     pub version: u64,
-    /// Generation build time derived from the underlying generation contents, not the profile link.
+    /// Generation build time, taken from the generation link's timestamp and normalized to the
+    /// earliest link time among all links pointing at the same toplevel.
     pub build_time: Option<GenerationTime>,
     /// Top-level specialisation name
     pub specialisation_name: Option<SpecialisationName>,
@@ -281,7 +282,8 @@ impl PartialOrd for GenerationLink {
 
 // Ordering must be consistent with the derived `PartialEq`: links from different profiles
 // can share the same version number, and a `BTreeSet` treats `Ordering::Equal` elements as
-// duplicates, so every field has to participate in the comparison.
+// duplicates, so every field has to participate in the comparison. `link_time` is excluded:
+// within a single run, links are distinguished by their path already.
 impl Ord for GenerationLink {
     fn cmp(&self, other: &Self) -> Ordering {
         self.version

@@ -47,7 +47,6 @@ let
             "$profDir/system-profiles/<profile-name>-*-link." 1>&2
           exit 1
         fi
-        fi
 
         PATH=${config.systemd.package}/lib/systemd:$PATH
         ${cfg.installCommand} \

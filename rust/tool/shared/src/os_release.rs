@@ -243,6 +243,27 @@ mod tests {
     use std::ffi::CStr;
 
     #[test]
+    fn display_parse_roundtrip_is_stable_for_backslash_values() -> Result<()> {
+        // The stale-os-release check in the installer compares a re-parsed rendering of the
+        // expected os-release against the parsed installed one. This requires that parsing a
+        // rendering twice yields the same value, even where `Display` does not escape values
+        // that `from_str` unescapes (e.g. backslashes).
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            String::from("PRETTY_NAME"),
+            String::from(r"LanzaOS 24.05\git"),
+        );
+        let os_release = OsRelease(fields);
+
+        let parsed_once = OsRelease::from_str(&os_release.to_string())?;
+        let parsed_twice = OsRelease::from_str(&parsed_once.to_string())?;
+
+        assert_eq!(parsed_once.0["PRETTY_NAME"], parsed_twice.0["PRETTY_NAME"]);
+
+        Ok(())
+    }
+
+    #[test]
     fn parses_correctly_from_str() -> Result<()> {
         let os_release_cstr = CStr::from_bytes_with_nul(b"ID=systemd-boot\nVERSION=\"252.1\"\n\0")?;
         let os_release_str = os_release_cstr.to_str()?;

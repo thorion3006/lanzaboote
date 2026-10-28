@@ -353,7 +353,7 @@ impl<S: Signer> Installer<S> {
 
         if let Some(pcrlock_paths) = &self.pcrlock_paths {
             let lanzaboote_image_pcrlock =
-                pcrlock_paths.lanzaboote_measurement(generation.version_tag());
+                pcrlock_paths.lanzaboote_measurement(lanzaboote_measurement_name(generation));
             lock_pe(&lanzaboote_image_path, &lanzaboote_image_pcrlock)
                 .context("Failed to lock Lanzaboote image with systemd-pcrlock")?;
             self.gc_roots.extend([&lanzaboote_image_pcrlock]);
@@ -395,6 +395,11 @@ impl<S: Signer> Installer<S> {
         {
             let expected_os_release = OsRelease::from_generation(generation)
                 .context("Failed to build expected OsRelease from generation.")?;
+            // Render and re-parse the expected os-release so that both sides of the
+            // comparison went through the same serialization. Comparing the in-memory value
+            // directly would report backslash-containing values as stale on every run.
+            let expected_os_release = OsRelease::from_str(&expected_os_release.to_string())
+                .context("Failed to parse the expected os-release.")?;
             if installed_os_release != expected_os_release {
                 return Ok(false);
             }
@@ -408,7 +413,7 @@ impl<S: Signer> Installer<S> {
 
         if let Some(pcrlock_paths) = &self.pcrlock_paths {
             let lanzaboote_image_pcrlock =
-                pcrlock_paths.lanzaboote_measurement(generation.version_tag());
+                pcrlock_paths.lanzaboote_measurement(lanzaboote_measurement_name(generation));
             if lanzaboote_image_pcrlock.exists() {
                 self.gc_roots.extend([&lanzaboote_image_pcrlock]);
             } else {
@@ -800,6 +805,33 @@ fn profile_component_for_efi(profile: &str) -> String {
     component
 }
 
+/// Name of the pcrlock measurement file for a generation's Lanzaboote stub image.
+///
+/// Generation counters are scoped per profile, so the version number alone does not identify
+/// a generation once named profiles are in play. Prefix non-default profiles with the same
+/// hashed profile component that the stub file name uses, so that measurements of same-numbered
+/// generations from different profiles cannot overwrite each other. Default-profile
+/// generations keep the bare version tag to stay compatible with previously created files.
+fn lanzaboote_measurement_name(generation: &Generation) -> String {
+    measurement_name_from_parts(
+        &generation.profile,
+        generation.is_default_profile,
+        &generation.version_tag(),
+    )
+}
+
+fn measurement_name_from_parts(
+    profile: &str,
+    is_default_profile: bool,
+    version_tag: &str,
+) -> String {
+    if is_default_profile {
+        version_tag.to_string()
+    } else {
+        format!("{}-{}", profile_component_for_efi(profile), version_tag)
+    }
+}
+
 fn malformed_generation_hint(link: &GenerationLink) -> String {
     if link.is_default_profile {
         format!("nix-env --delete-generations {}", link.version)
@@ -933,7 +965,7 @@ fn ensure_parent_dir(path: &Path) {
 mod tests {
     use std::ffi::OsStr;
 
-    use super::{profile_component_for_efi, shell_quote};
+    use super::{measurement_name_from_parts, profile_component_for_efi, shell_quote};
 
     #[test]
     fn profile_component_for_efi_is_stable() {
@@ -973,5 +1005,17 @@ mod tests {
             shell_quote(OsStr::new("/tmp/it's complicated")),
             "'/tmp/it'\"'\"'s complicated'"
         );
+    }
+
+    #[test]
+    fn measurement_names_do_not_collide_across_profiles() {
+        let default = measurement_name_from_parts("system", true, "3");
+        let named = measurement_name_from_parts("workstation", false, "3");
+        let named_same_number_other_profile = measurement_name_from_parts("server", false, "3");
+
+        assert_eq!(default, "3");
+        assert_ne!(named, default);
+        assert_ne!(named, named_same_number_other_profile);
+        assert!(named.starts_with(&profile_component_for_efi("workstation")));
     }
 }

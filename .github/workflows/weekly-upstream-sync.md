@@ -135,14 +135,17 @@ safe-outputs:
             # Only (re)create the sync branch when it does not exist yet or still points at
             # an (older) upstream commit. If it carries a manual conflict resolution, the
             # force-push below would destroy that work. A resolution commit created by the
-            # held-paths policy below is regenerable, so a sync branch whose tip is such a
-            # policy commit is recreated on top of the newer upstream instead of stalling
-            # all later syncs.
+            # held-paths policy below is regenerable, and the exact generated commit is
+            # recorded in the ${sync_branch}-generated marker branch. Only a sync branch
+            # whose tip is exactly that marker commit is recreated; any amended or
+            # rewritten resolution differs from the marker and is left untouched.
             remote_sync_sha="$(git ls-remote origin "refs/heads/${sync_branch}" | cut -f1)"
             if [ -n "${remote_sync_sha}" ] && ! git merge-base --is-ancestor "${remote_sync_sha}" "${upstream_sha}"; then
-              git fetch --no-tags origin "${sync_branch}:${sync_branch}" >/dev/null 2>&1 || true
-              remote_sync_tip="$(git log -1 --format=%s "${remote_sync_sha}" 2>/dev/null || true)"
-              if [ "${remote_sync_tip}" != "Sync with ${upstream_repo}:${upstream_branch} (keep fork side for held paths)" ]; then
+              git fetch --no-tags origin \
+                "${sync_branch}:${sync_branch}" \
+                "+refs/heads/${sync_branch}-generated:${sync_branch}-generated" >/dev/null 2>&1 || true
+              generated_sha="$(git rev-parse --verify --quiet "${sync_branch}-generated" 2>/dev/null || true)"
+              if [ -z "${generated_sha}" ] || [ "${generated_sha}" != "${remote_sync_sha}" ]; then
                 echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
                 exit 0
               fi
@@ -215,8 +218,15 @@ safe-outputs:
 
             if [ "${policy_applied}" -eq 0 ]; then
               git checkout -B "${sync_branch}" "${upstream_ref}"
+              git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
+              # No policy resolution this time; drop a stale marker so the guard above
+              # does not treat an unrelated branch head as regenerable.
+              git push origin --delete "${sync_branch}-generated" >/dev/null 2>&1 || true
+            else
+              git push --force origin \
+                "${sync_branch}:refs/heads/${sync_branch}" \
+                "${sync_branch}:refs/heads/${sync_branch}-generated"
             fi
-            git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
 
             existing_pr="$(gh pr list \
               --base "${base_branch}" \

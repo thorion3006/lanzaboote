@@ -1,0 +1,18 @@
+# Paths held by the fork while upstream PR #673 is unmerged (see fork PR #7).
+#
+# Our master carries an adopted implementation of nix-community/lanzaboote#673
+# in these paths; upstream master does not have #673, so weekly sync rebases
+# conflict here. When the weekly upstream sync hits conflicts CONFINED to
+# these paths (directory prefixes allowed), it resolves them by keeping the
+# fork side for exactly these paths and taking upstream everywhere else. The
+# resolution commit lists any upstream commits shadowed by this, so nothing
+# is dropped silently. Conflicts anywhere else still produce a manual
+# conflict PR.
+#
+# Remove this file once #673 (ideally with our complementary patches) is
+# merged upstream, so syncs revert to plain rebases.
+nix/modules/lanzaboote.nix
+nix/tests/
+rust/tool/shared/
+rust/tool/systemd/
+docs/how-to-guides/enable-measured-boot.md

@@ -129,7 +129,7 @@ safe-outputs:
               exit 0
             fi
 
-            echo "Rebase hit conflicts. Opening or updating a PR instead."
+            echo "Rebase hit conflicts. Trying the held-paths policy before falling back to a PR."
             git rebase --abort || true
 
             # Only (re)create the sync branch when it does not exist yet or still points at
@@ -141,7 +141,67 @@ safe-outputs:
               exit 0
             fi
 
-            git checkout -B "${sync_branch}" "${upstream_ref}"
+            # While .github/upstream-sync-keep-ours exists, master deliberately holds the
+            # listed paths (adopted from an unmerged upstream PR). If every conflict is
+            # confined to those paths, resolve by keeping the fork side there and taking
+            # upstream everywhere else, so the sync PR is mergeable as-is. Upstream commits
+            # shadowed by keeping our side are listed in the resolution commit message.
+            policy_applied=0
+            keep_ours_file=".github/upstream-sync-keep-ours"
+            if [ -f "${keep_ours_file}" ]; then
+              git checkout -B "${work_branch}" "${origin_ref}"
+              set +e
+              git merge --no-commit --no-ff "${upstream_ref}" >/dev/null 2>&1
+              merge_status=$?
+              set -e
+              conflicted="$(git diff --name-only --diff-filter=U)"
+              if [ "${merge_status}" -eq 0 ] || [ -n "${conflicted}" ]; then
+                outside_conflicts=""
+                while IFS= read -r path; do
+                  [ -n "${path}" ] || continue
+                  keep=0
+                  while IFS= read -r prefix; do
+                    case "${prefix}" in ''|'#'*) continue ;; esac
+                    case "${path}" in "${prefix}"*) keep=1; break ;; esac
+                  done < "${keep_ours_file}"
+                  if [ "${keep}" -eq 0 ]; then
+                    outside_conflicts="${outside_conflicts}${path}\n"
+                  fi
+                done <<< "${conflicted}"
+                if [ -z "${outside_conflicts}" ]; then
+                  while IFS= read -r path; do
+                    [ -n "${path}" ] || continue
+                    git checkout --ours -- "${path}"
+                    git add -- "${path}"
+                  done <<< "${conflicted}"
+                  git add -A
+                  keep_paths="$(grep -v '^#' "${keep_ours_file}" | grep -v '^$' || true)"
+                  shadowed=""
+                  if [ -n "${keep_paths}" ]; then
+                    shadowed="$(git log --oneline "${origin_sha}..${upstream_sha}" -- ${keep_paths} || true)"
+                  fi
+                  git commit \
+                    -m "Sync with ${upstream_repo}:${upstream_branch} (keep fork side for held paths)" \
+                    -m "Rebase conflicts were confined to the paths held in ${keep_ours_file} and were resolved by keeping the fork side there; upstream is taken everywhere else." \
+                    -m "Shadowed upstream commits (review these):" \
+                    -m "${shadowed:-None}"
+                  git checkout -B "${sync_branch}"
+                  policy_applied=1
+                  echo "Applied held-paths policy; the sync branch carries the resolved sync."
+                else
+                  echo "Conflicts outside the held paths; manual resolution required:"
+                  printf '%b' "${outside_conflicts}"
+                  git merge --abort || true
+                fi
+              else
+                echo "Merge attempt failed without conflicts; falling back to a manual PR."
+                git merge --abort || true
+              fi
+            fi
+
+            if [ "${policy_applied}" -eq 0 ]; then
+              git checkout -B "${sync_branch}" "${upstream_ref}"
+            fi
             git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
 
             existing_pr="$(gh pr list \
@@ -187,7 +247,23 @@ Update the default branch without merge commits.
 
 - If this repository is simply behind upstream, fast-forward `master`.
 - If this repository has local commits that can be replayed cleanly, rebase them onto upstream and update `master` with a linear history.
-- If the rebase would conflict, do not resolve conflicts automatically. Open or update a pull request from a dedicated sync branch so a maintainer can resolve it manually.
+- If the rebase would conflict, check the held-paths policy below: conflicts confined to the held paths are resolved automatically by keeping the fork side; anything else still opens a conflict PR for manual resolution.
+
+## Held paths (temporary, until upstream PR #673 lands)
+
+`master` carries an adopted implementation of [nix-community/lanzaboote#673](https://github.com/nix-community/lanzaboote/pull/673)
+in the paths listed in `.github/upstream-sync-keep-ours`. Upstream does not have #673
+yet, so rebases conflict in those files. The policy, applied automatically by the tool:
+
+- If every conflicted path is under the held list, the sync is resolved by keeping the
+  fork side for exactly those paths and taking upstream everywhere else. The resulting
+  sync PR is mergeable as-is, and the resolution commit message lists the shadowed
+  upstream commits for review.
+- If any conflict falls outside the held list, the sync branch is set to plain upstream
+  and the PR requires manual resolution, as before.
+
+Once #673 (ideally with our complementary patches) is merged upstream, remove
+`.github/upstream-sync-keep-ours` so syncs revert to plain rebases.
 
 ## Token
 
@@ -196,7 +272,7 @@ Use the `GH_AW_SYNC_TOKEN` repository secret for pushing branches and creating p
 ## Instructions
 
 1. Fetch `origin/master` and `nix-community/lanzaboote:master`, then inspect the relationship between the two histories with `git merge-base`, `git log`, and similar read-only commands.
-2. Never create merge commits. Do not use `git merge` for the sync.
+2. Never create merge commits on the direct fast-forward/rebase paths. A sync resolved via the held-paths policy intentionally carries one resolution commit on the sync branch, merged through a PR.
 3. If the branch is already current, explain that no action is required and stop.
 4. Otherwise call the `upstream-sync` tool once with:
    - `base_branch`: `master`
@@ -204,5 +280,5 @@ Use the `GH_AW_SYNC_TOKEN` repository secret for pushing branches and creating p
    - `upstream_branch`: `master`
    - `sync_branch`: `gh-aw/upstream-sync-master`
    - `pr_title`: `Sync master with nix-community/lanzaboote:master`
-   - `pr_body`: a short explanation that the automated weekly sync hit rebase conflicts, no merge commit was created, and the PR exists for manual conflict resolution.
+   - `pr_body`: a short explanation of what happened: if the held-paths policy resolved the sync, say the PR is mergeable, that the fork side was kept for the paths in `.github/upstream-sync-keep-ours`, and that shadowed upstream commits are listed in the resolution commit; otherwise, that the weekly sync hit rebase conflicts outside the held paths and the PR needs manual conflict resolution.
 5. Keep the final response concise and factual. State whether the repository was already up to date, was synced directly, or required a conflict PR.

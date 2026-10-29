@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 use crate::architecture::SystemdArchitectureExt;
 use crate::esp::SystemdEspPaths;
-use crate::pcrlock::{PcrlockPaths, lock_pe};
+use crate::pcrlock::{PcrlockPaths, lock_pe, lock_pe_from_bytes};
 use crate::version::SystemdVersion;
 use lanzaboote_tool::architecture::Architecture;
 use lanzaboote_tool::esp::EspPaths;
@@ -34,6 +34,7 @@ pub struct InstallerBuilder {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_directory: Option<PathBuf>,
+    protected_system: Option<PathBuf>,
     esp: PathBuf,
     generation_links: Vec<PathBuf>,
 }
@@ -48,6 +49,7 @@ impl InstallerBuilder {
         configuration_limit: usize,
         bootcounting_initial_tries: u32,
         pcrlock_directory: Option<PathBuf>,
+        protected_system: Option<PathBuf>,
         esp: PathBuf,
         generation_links: Vec<PathBuf>,
     ) -> Self {
@@ -59,6 +61,7 @@ impl InstallerBuilder {
             configuration_limit,
             bootcounting_initial_tries,
             pcrlock_directory,
+            protected_system,
             esp,
             generation_links,
         }
@@ -84,6 +87,7 @@ impl InstallerBuilder {
             configuration_limit: self.configuration_limit,
             bootcounting_initial_tries: self.bootcounting_initial_tries,
             pcrlock_paths,
+            protected_system: self.protected_system,
             esp_paths,
             generation_links: self.generation_links,
             arch: self.arch,
@@ -101,6 +105,7 @@ pub struct Installer<S: Signer> {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_paths: Option<PcrlockPaths>,
+    protected_system: Option<PathBuf>,
     esp_paths: SystemdEspPaths,
     generation_links: Vec<PathBuf>,
     arch: Architecture,
@@ -114,8 +119,21 @@ impl<S: Signer> Installer<S> {
             .generation_links
             .iter()
             .map(GenerationLink::from_path)
-            .collect::<Result<Vec<GenerationLink>>>()?;
-        self.install_generations_from_links(&links)?;
+            .collect::<Result<BTreeSet<GenerationLink>>>()?;
+
+        let booted_link = self
+            .protected_system
+            .as_ref()
+            .and_then(|p| fs::canonicalize(p).ok())
+            .and_then(|protected_system| {
+                log::info!("Protecting system {}", protected_system.display());
+                links
+                    .iter()
+                    .find(|link| link_provides_toplevel(link, &protected_system))
+            })
+            .cloned();
+
+        self.install_generations_from_links(links.iter(), booted_link.as_ref())?;
 
         self.install_systemd_boot()?;
 
@@ -135,10 +153,11 @@ impl<S: Signer> Installer<S> {
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("nixos-"))
                 })?;
-            // Only collect garbage in the Lanzaboote directory because that's the only directory
-            // we fully control. Bootloader measurements are not garbage collected because there is
-            // only a single installed bootloader version without the possibility of rollbacks.
+            // Only collect garbage in the Lanzaboote and the boot loader directory because those
+            // are the only directories we fully control. Of the boot loader measurements, only the
+            // ones for the installed and for the booted boot loader are roots.
             if let Some(pcrlock_paths) = &self.pcrlock_paths {
+                self.gc_roots.collect_garbage(pcrlock_paths.bootloader())?;
                 self.gc_roots.collect_garbage(pcrlock_paths.lanzaboote())?;
             }
         } else {
@@ -158,9 +177,18 @@ impl<S: Signer> Installer<S> {
     }
 
     /// Install all generations from the provided `GenerationLinks`.
-    fn install_generations_from_links(&mut self, links: &[GenerationLink]) -> Result<()> {
+    ///
+    /// The `configuration_limit` is applied after parsing, on generations ordered globally by
+    /// their normalized build time (see `normalize_generation_times`), so that generations from
+    /// different profiles are retained by age rather than by their independent version numbers.
+    /// The currently booted system (if given) is kept bootable even when it falls outside of the
+    /// limit, at the cost of dropping the oldest retained generation instead.
+    fn install_generations_from_links<'a>(
+        &mut self,
+        links: impl Iterator<Item = &'a GenerationLink>,
+        booted_link: Option<&GenerationLink>,
+    ) -> Result<()> {
         let mut generations = links
-            .iter()
             .filter_map(|link| {
                 let generation_result = Generation::from_link(link)
                     .with_context(|| format!("Failed to build generation from link: {link:?}"));
@@ -190,6 +218,25 @@ impl<S: Signer> Installer<S> {
                 .take(self.configuration_limit)
                 .rev()
                 .collect();
+        }
+
+        // Keep the currently booted system bootable even if it falls outside of the
+        // configuration limit, at the cost of dropping the oldest retained generation.
+        // With a configuration limit of one, dropping the oldest would remove the generation
+        // that was just built and could never be booted into, so both are kept instead.
+        if let Some(booted_link) = booted_link
+            && !generations.iter().any(|generation| {
+                generation.is_default_profile == booted_link.is_default_profile
+                    && generation.profile == booted_link.profile
+                    && generation.version == booted_link.version
+            })
+            && let Ok(booted_generation) = Generation::from_link(booted_link)
+        {
+            if generations.len() > 1 {
+                generations.remove(0);
+            }
+            generations.push(booted_generation);
+            order_generations(&mut generations);
         }
 
         if generations.is_empty() {
@@ -308,7 +355,7 @@ impl<S: Signer> Installer<S> {
 
         if let Some(pcrlock_paths) = &self.pcrlock_paths {
             let lanzaboote_image_pcrlock =
-                pcrlock_paths.lanzaboote_measurement(generation.version_tag());
+                pcrlock_paths.lanzaboote_measurement(lanzaboote_measurement_name(generation));
             lock_pe(&lanzaboote_image_path, &lanzaboote_image_pcrlock)
                 .context("Failed to lock Lanzaboote image with systemd-pcrlock")?;
             self.gc_roots.extend([&lanzaboote_image_pcrlock]);
@@ -350,6 +397,11 @@ impl<S: Signer> Installer<S> {
         {
             let expected_os_release = OsRelease::from_generation(generation)
                 .context("Failed to build expected OsRelease from generation.")?;
+            // Render and re-parse the expected os-release so that both sides of the
+            // comparison went through the same serialization. Comparing the in-memory value
+            // directly would report backslash-containing values as stale on every run.
+            let expected_os_release = OsRelease::from_str(&expected_os_release.to_string())
+                .context("Failed to parse the expected os-release.")?;
             if installed_os_release != expected_os_release {
                 return Ok(false);
             }
@@ -363,7 +415,7 @@ impl<S: Signer> Installer<S> {
 
         if let Some(pcrlock_paths) = &self.pcrlock_paths {
             let lanzaboote_image_pcrlock =
-                pcrlock_paths.lanzaboote_measurement(generation.version_tag());
+                pcrlock_paths.lanzaboote_measurement(lanzaboote_measurement_name(generation));
             if lanzaboote_image_pcrlock.exists() {
                 self.gc_roots.extend([&lanzaboote_image_pcrlock]);
             } else {
@@ -447,15 +499,44 @@ impl<S: Signer> Installer<S> {
     /// to the ESP.
     ///
     /// Checking for the version also allows us to skip buggy systemd versions in the future.
-    fn install_systemd_boot(&self) -> Result<()> {
-        let systemd_boot = self
+    fn install_systemd_boot(&mut self) -> Result<()> {
+        let systemd_boot_candidate = self
             .systemd
             .join("lib/systemd/boot/efi")
             .join(self.arch.systemd_filename());
 
-        let newer_systemd_boot_available =
-            newer_systemd_boot(&systemd_boot, &self.esp_paths.efi_fallback)?
-                || newer_systemd_boot(&systemd_boot, &self.esp_paths.systemd_boot)?;
+        // If the version of the source binary cannot be read, something is irrecoverably wrong.
+        let candidate_version = SystemdVersion::from_systemd_boot_binary(&systemd_boot_candidate)
+            .with_context(|| {
+            format!("Failed to read systemd-boot version from {systemd_boot_candidate:?}.")
+        })?;
+
+        let primary = &self.esp_paths.systemd_boot;
+        let primary_version = match SystemdVersion::from_systemd_boot_binary(primary) {
+            Ok(version) => Some(version),
+            Err(_) if !primary.exists() => None,
+            Err(e) => {
+                log::warn!("Failed to read systemd-boot version from {primary:?}: {e:#}");
+                None
+            }
+        };
+
+        let fallback = &self.esp_paths.efi_fallback;
+        let fallback_version = match SystemdVersion::from_systemd_boot_binary(fallback) {
+            Ok(version) => Some(version),
+            Err(_) if !fallback.exists() => None,
+            Err(e) => {
+                log::warn!("Failed to read systemd-boot version from {fallback:?}: {e:#}");
+                None
+            }
+        };
+
+        let newer_systemd_boot_available = match (&primary_version, &fallback_version) {
+            (Some(primary), Some(fallback)) => {
+                candidate_version > *primary || candidate_version > *fallback
+            }
+            _ => true,
+        };
         if newer_systemd_boot_available {
             log::info!("Updating systemd-boot...")
         };
@@ -466,54 +547,121 @@ impl<S: Signer> Installer<S> {
             log::warn!("systemd-boot is not signed. Replacing it with a signed binary...")
         };
 
-        // If Measured Boot is not enabled (i.e. `pcrlock_paths` is `None`), this should be true.
-        // Otherwise we will always re-install systemd-boot if Measured Boot is disabled.
-        let measurement_exists = self
-            .pcrlock_paths
+        // `Some(version)` if the binary that is currently installed on the ESP is kept as it is,
+        // `None` if it is replaced by the candidate.
+        let keep_installed = primary_version
             .as_ref()
-            .is_none_or(|p| p.bootloader_measurement("current").exists());
-        if !measurement_exists {
-            log::warn!(
-                "systemd-boot has not been measured. Creating measurement and re-installing..."
-            )
-        };
+            .filter(|_| !newer_systemd_boot_available && systemd_boot_is_signed);
 
-        if newer_systemd_boot_available || !systemd_boot_is_signed || !measurement_exists {
-            if let Some(pcrlock_paths) = &self.pcrlock_paths {
-                // We do not version the bootloader measurement file. There will only ever be one
-                // bootloader version installed on the ESP and there is no rollback mechanism for it.
-                // That's why we also do not extend the GC roots with the path.
-                //
-                // However, we call this file "next" so that while the new bootloader is installed,
-                // the measurements of the current and next remain available.
-                let bootloader_pcrlock = pcrlock_paths.bootloader_measurement("next");
-                lock_pe(&systemd_boot, &bootloader_pcrlock)
-                    .context("Failed to lock Lanzaboote image with systemd-pcrlock")?;
+        // Boot loader measurements are named after their corresponding systemd version. This way
+        // the measurement of the booted boot loader can survive multiple consecutive loader updates
+        // on the ESP, which is required to cover PCR4 in the policy throughout these updates.
+        let mut keep_measurements: Vec<PathBuf> = Vec::new();
+
+        if let Some(pcrlock_paths) = &self.pcrlock_paths {
+            // Measurements that were created before the versioned files are deleted as they would
+            // otherwise be picked up by systemd-pcrlock as alternatives for PCR4.
+            //
+            // It would be non-trivial to identify which ones are relevant to us and in the worst
+            // case, i.e. when a user ignored the instructions to reboot between two boot loader
+            // updates, none of them would match.
+            //
+            // On systems that have both a validly signed loader and are booted with that same
+            // loader, i.e. where users rebooted after the most recent loader update, a versioned
+            // measurement is created for that signed and booted loader (see below).
+            for legacy_name in ["next", "previous", "current"] {
+                let legacy_path = pcrlock_paths.bootloader_measurement(legacy_name);
+                if legacy_path.exists() {
+                    log::info!(
+                        "Removing leftover measurement file: {}",
+                        legacy_path.display()
+                    );
+                    fs::remove_file(&legacy_path).with_context(|| {
+                        format!(
+                            "Failed to remove leftover measurement file {}",
+                            legacy_path.display()
+                        )
+                    })?;
+                }
             }
 
+            let installed_measurement = pcrlock_paths
+                .bootloader_measurement(keep_installed.unwrap_or(&candidate_version).to_string());
+
+            if keep_installed.is_none() {
+                lock_pe(&systemd_boot_candidate, &installed_measurement)
+                    .context("Failed to lock systemd-boot image with systemd-pcrlock")?;
+            }
+
+            let booted_version = SystemdVersion::from_efivar();
+
+            // If the loader on the ESP has no measurement, either because it was written before
+            // versioned loader measurements, or because measured boot was not enabled before,
+            // the measurement is recreated from that loader, which has to happen before it is
+            // potentially replaced below.
+            // The measurement is only recreated if the PE passes signature verification.
+            if let Some(primary) = &primary_version
+                && systemd_boot_is_signed
+                && (keep_installed.is_some()
+                    || booted_version
+                        .as_ref()
+                        .is_ok_and(|booted| booted == primary))
+            {
+                let primary_measurement = pcrlock_paths.bootloader_measurement(primary.to_string());
+                if !primary_measurement.exists() {
+                    log::info!("No measurement for the installed boot loader. Recreating...");
+                    let primary_pe = self
+                        .signer
+                        .read_verified(&self.esp_paths.systemd_boot)
+                        .context("Failed to read the installed systemd-boot binary.")?;
+                    lock_pe_from_bytes(&primary_pe, &primary_measurement)
+                        .context("Failed to lock systemd-boot image with systemd-pcrlock")?;
+                }
+            }
+
+            // the measurement for the loader that ends up on the ESP won't be collected
+            keep_measurements.push(installed_measurement);
+
+            // same for the booted boot loader, without it the policy cannot cover PCR4 for the running system
+            match booted_version {
+                Ok(booted_version) => {
+                    let booted_measurement =
+                        pcrlock_paths.bootloader_measurement(booted_version.to_string());
+                    if booted_measurement.exists() {
+                        keep_measurements.push(booted_measurement);
+                    } else if primary_version.as_ref() == Some(&booted_version)
+                        && !systemd_boot_is_signed
+                    {
+                        // if the installed boot loader failed the signature check above, it
+                        // triggers a reinstall. When this installed loader is also happens to be
+                        // the currently booted loader, a measurement is intentionally not recreated
+                        // for it
+                        log::warn!(
+                            "Refusing to recreate measurement for unverified loader, PCR4 expected to drop from protection mask."
+                        )
+                    } else {
+                        // when neither the measurement for the currently installed, nor that for
+                        // the candidate that is about to be installed match the booted version, a
+                        // policy that covers PCR4 cannot be created without extra logic (e.g. by
+                        // reading the event log and synthesizing a .pcrlock file from that)
+                        log::warn!(
+                            "Failed to identify measurement for booted boot loader, PCR4 expected to drop from protection mask."
+                        )
+                    }
+                }
+                Err(e) => log::warn!(
+                    "Failed to read systemd-boot version from EFI variable: {e:#}. PCR4 expected to drop from protection mask."
+                ),
+            }
+        }
+
+        self.gc_roots.extend(keep_measurements.iter());
+
+        if keep_installed.is_none() {
             for to in [&self.esp_paths.efi_fallback, &self.esp_paths.systemd_boot] {
                 log::info!("Installing {}", to.display());
-                install_signed(&self.signer, &systemd_boot, to)
+                install_signed(&self.signer, &systemd_boot_candidate, to)
                     .with_context(|| format!("Failed to install systemd-boot binary to: {to:?}"))?;
-            }
-
-            // After installing the bootloader, rename the pcrlock measurement from "next" to
-            // "current". So that we can install "next" on the next update again.
-            if let Some(pcrlock_paths) = &self.pcrlock_paths {
-                let next = pcrlock_paths.bootloader_measurement("next");
-                let current = pcrlock_paths.bootloader_measurement("current");
-                log::debug!(
-                    "Renaming {} to {} after installing the bootloader.",
-                    next.display(),
-                    current.display()
-                );
-                fs::rename(&next, &current).with_context(|| {
-                    format!(
-                        "Failed to rename {} to {}",
-                        next.display(),
-                        current.display()
-                    )
-                })?;
             }
         }
 
@@ -524,7 +672,7 @@ impl<S: Signer> Installer<S> {
         .with_context(|| {
             format!(
                 "Failed to install systemd-boot loader.conf to {:?}",
-                &self.esp_paths.systemd_boot_loader_config
+                self.esp_paths.systemd_boot_loader_config
             )
         })?;
 
@@ -659,6 +807,59 @@ fn profile_component_for_efi(profile: &str) -> String {
     component
 }
 
+/// Name of the pcrlock measurement file for a generation's Lanzaboote stub image.
+///
+/// Generation counters are scoped per profile, so the version number alone does not identify
+/// a generation once named profiles are in play. Prefix non-default profiles with the same
+/// hashed profile component that the stub file name uses, so that measurements of same-numbered
+/// generations from different profiles cannot overwrite each other. Default-profile
+/// generations keep the bare version tag to stay compatible with previously created files.
+fn lanzaboote_measurement_name(generation: &Generation) -> String {
+    measurement_name_from_parts(
+        &generation.profile,
+        generation.is_default_profile,
+        &generation.version_tag(),
+    )
+}
+
+fn measurement_name_from_parts(
+    profile: &str,
+    is_default_profile: bool,
+    version_tag: &str,
+) -> String {
+    if is_default_profile {
+        version_tag.to_string()
+    } else {
+        format!("{}-{}", profile_component_for_efi(profile), version_tag)
+    }
+}
+
+/// Whether the generation behind this link provides the protected system.
+///
+/// `/run/booted-system` points at the toplevel of whatever system was booted. When a
+/// specialisation was booted, that is the specialisation's toplevel rather than the parent
+/// toplevel the profile link points at, so the search also has to walk the generation's
+/// specialisations. A link whose bootspec cannot be read only matches directly; such
+/// generations are reported as broken, which disables garbage collection and protects them
+/// that way.
+fn link_provides_toplevel(link: &GenerationLink, protected_system: &Path) -> bool {
+    fs::canonicalize(&link.path).is_ok_and(|resolved| resolved == protected_system)
+        || Generation::from_link(link)
+            .is_ok_and(|generation| generation_provides_toplevel(&generation, protected_system))
+}
+
+fn generation_provides_toplevel(generation: &Generation, protected_system: &Path) -> bool {
+    let toplevel_matches = |toplevel: &Path| {
+        fs::canonicalize(toplevel).is_ok_and(|resolved| resolved == protected_system)
+    };
+
+    toplevel_matches(&generation.spec.bootspec.bootspec.toplevel.0)
+        || generation
+            .specialisations
+            .values()
+            .any(|specialisation| generation_provides_toplevel(specialisation, protected_system))
+}
+
 fn malformed_generation_hint(link: &GenerationLink) -> String {
     if link.is_default_profile {
         format!("nix-env --delete-generations {}", link.version)
@@ -684,53 +885,6 @@ fn malformed_generation_hint(link: &GenerationLink) -> String {
 fn shell_quote(value: &OsStr) -> String {
     let value = value.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-
-    use super::{profile_component_for_efi, shell_quote};
-
-    #[test]
-    fn profile_component_for_efi_is_stable() {
-        let component = profile_component_for_efi("Workstation-1_2.test");
-        assert_eq!(component, profile_component_for_efi("Workstation-1_2.test"));
-        assert_eq!(component.len(), 64);
-        assert!(
-            component
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        );
-    }
-
-    #[test]
-    fn profile_component_for_efi_distinguishes_case() {
-        assert_ne!(
-            profile_component_for_efi("Work"),
-            profile_component_for_efi("work")
-        );
-    }
-
-    #[test]
-    fn profile_component_for_efi_is_injective_for_escape_sequences() {
-        assert_ne!(
-            profile_component_for_efi("foo bar"),
-            profile_component_for_efi("foo~20bar")
-        );
-    }
-
-    #[test]
-    fn shell_quote_handles_spaces_and_single_quotes() {
-        assert_eq!(
-            shell_quote(OsStr::new("/tmp/profile name")),
-            "'/tmp/profile name'"
-        );
-        assert_eq!(
-            shell_quote(OsStr::new("/tmp/it's complicated")),
-            "'/tmp/it'\"'\"'s complicated'"
-        );
-    }
 }
 
 /// Install a PE file. The PE gets signed in the process.
@@ -835,28 +989,61 @@ fn ensure_parent_dir(path: &Path) {
     }
 }
 
-/// Determine if a newer systemd-boot version is available.
-///
-/// "Newer" can mean
-///   (1) no file exists at the destination,
-///   (2) the file at the destination is malformed,
-///   (3) a binary with a higher version is available.
-fn newer_systemd_boot(from: &Path, to: &Path) -> Result<bool> {
-    // If the file doesn't exists at the destination, it should be installed.
-    if !to.exists() {
-        return Ok(true);
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::{measurement_name_from_parts, profile_component_for_efi, shell_quote};
+
+    #[test]
+    fn profile_component_for_efi_is_stable() {
+        let component = profile_component_for_efi("Workstation-1_2.test");
+        assert_eq!(component, profile_component_for_efi("Workstation-1_2.test"));
+        assert_eq!(component.len(), 64);
+        assert!(
+            component
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
     }
 
-    // If the version from the source binary cannot be read, something is irrecoverably wrong.
-    let from_version = SystemdVersion::from_systemd_boot_binary(from)
-        .with_context(|| format!("Failed to read systemd-boot version from {from:?}."))?;
+    #[test]
+    fn profile_component_for_efi_distinguishes_case() {
+        assert_ne!(
+            profile_component_for_efi("Work"),
+            profile_component_for_efi("work")
+        );
+    }
 
-    // If the version cannot be read from the destination binary, it is malformed. It should be
-    // forcibly reinstalled.
-    let to_version = match SystemdVersion::from_systemd_boot_binary(to) {
-        Ok(version) => version,
-        _ => return Ok(true),
-    };
+    #[test]
+    fn profile_component_for_efi_is_injective_for_escape_sequences() {
+        assert_ne!(
+            profile_component_for_efi("foo bar"),
+            profile_component_for_efi("foo~20bar")
+        );
+    }
 
-    Ok(from_version > to_version)
+    #[test]
+    fn shell_quote_handles_spaces_and_single_quotes() {
+        assert_eq!(
+            shell_quote(OsStr::new("/tmp/profile name")),
+            "'/tmp/profile name'"
+        );
+        assert_eq!(
+            shell_quote(OsStr::new("/tmp/it's complicated")),
+            "'/tmp/it'\"'\"'s complicated'"
+        );
+    }
+
+    #[test]
+    fn measurement_names_do_not_collide_across_profiles() {
+        let default = measurement_name_from_parts("system", true, "3");
+        let named = measurement_name_from_parts("workstation", false, "3");
+        let named_same_number_other_profile = measurement_name_from_parts("server", false, "3");
+
+        assert_eq!(default, "3");
+        assert_ne!(named, default);
+        assert_ne!(named, named_same_number_other_profile);
+        assert!(named.starts_with(&profile_component_for_efi("workstation")));
+    }
 }

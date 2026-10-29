@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -70,7 +71,8 @@ pub struct Generation {
     pub is_default_profile: bool,
     /// Profile symlink index
     pub version: u64,
-    /// Generation build time derived from the underlying generation contents, not the profile link.
+    /// Generation build time, taken from the generation link's timestamp and normalized to the
+    /// earliest link time among all links pointing at the same toplevel.
     pub build_time: Option<GenerationTime>,
     /// Top-level specialisation name
     pub specialisation_name: Option<SpecialisationName>,
@@ -251,7 +253,7 @@ fn month_to_u8(month: Month) -> u8 {
 ///
 /// Can be built from a symlink in /nix/var/nix/profiles/ alone because the name of the
 /// symlink encodes the version number.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationLink {
     pub profile: String,
     pub is_default_profile: bool,
@@ -269,6 +271,26 @@ impl GenerationLink {
             path: PathBuf::from(path.as_ref()),
             link_time: read_build_time(path.as_ref()).ok(),
         })
+    }
+}
+
+impl PartialOrd for GenerationLink {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Ordering must be consistent with the derived `PartialEq`: links from different profiles
+// can share the same version number, and a `BTreeSet` treats `Ordering::Equal` elements as
+// duplicates, so every field has to participate in the comparison. `link_time` is excluded:
+// within a single run, links are distinguished by their path already.
+impl Ord for GenerationLink {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.version
+            .cmp(&other.version)
+            .then_with(|| self.profile.cmp(&other.profile))
+            .then_with(|| self.is_default_profile.cmp(&other.is_default_profile))
+            .then_with(|| self.path.cmp(&other.path))
     }
 }
 
@@ -330,6 +352,8 @@ fn parse_version(path: impl AsRef<Path>) -> Result<u64> {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
     #[test]
     fn parse_profile_correctly() {
         let path = Path::new("system-2-link");
@@ -346,6 +370,57 @@ mod tests {
         let path = Path::new("system-2-link");
         let parsed_version = parse_version(path).unwrap();
         assert_eq!(parsed_version, 2,);
+    }
+
+    fn test_link(version: u64, profile: &str) -> GenerationLink {
+        GenerationLink {
+            profile: String::from(profile),
+            is_default_profile: profile == "system",
+            version,
+            path: PathBuf::new(),
+            link_time: None,
+        }
+    }
+
+    #[test]
+    fn generation_link_ordering() {
+        let gen_0 = test_link(0, "system");
+        let gen_1 = test_link(1, "system");
+        assert!(gen_1 > gen_0)
+    }
+
+    #[test]
+    fn generation_link_set() {
+        let gen_0 = test_link(0, "system");
+        let gen_1 = test_link(1, "system");
+
+        let mut set = BTreeSet::new();
+        set.insert(gen_0);
+        set.insert(gen_1);
+
+        let mut iter = set.iter();
+        assert_eq!(iter.next().unwrap().version, 0);
+        assert_eq!(iter.next().unwrap().version, 1);
+
+        let mut reverse = set.iter().rev();
+        assert_eq!(reverse.next().unwrap().version, 1);
+        assert_eq!(reverse.next().unwrap().version, 0);
+    }
+
+    #[test]
+    fn generation_links_with_same_version_in_different_profiles_are_distinct() {
+        let default = test_link(1, "system");
+        let named = GenerationLink {
+            profile: String::from("system"),
+            is_default_profile: false,
+            path: PathBuf::from("/nix/var/nix/profiles/system-profiles/system-1-link"),
+            ..test_link(1, "system")
+        };
+
+        let mut set = BTreeSet::new();
+        set.insert(default);
+        set.insert(named);
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

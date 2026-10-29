@@ -132,6 +132,15 @@ safe-outputs:
             echo "Rebase hit conflicts. Opening or updating a PR instead."
             git rebase --abort || true
 
+            # Only (re)create the sync branch when it does not exist yet or still points at
+            # an (older) upstream commit. If it carries a manual conflict resolution, the
+            # force-push below would destroy that work.
+            remote_sync_sha="$(git ls-remote origin "refs/heads/${sync_branch}" | cut -f1)"
+            if [ -n "${remote_sync_sha}" ] && ! git merge-base --is-ancestor "${remote_sync_sha}" "${upstream_sha}"; then
+              echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
+              exit 0
+            fi
+
             git checkout -B "${sync_branch}" "${upstream_ref}"
             git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
 
@@ -141,6 +150,17 @@ safe-outputs:
               --state open \
               --json number \
               --jq '.[0].number // empty')"
+
+            if [ -z "${existing_pr}" ]; then
+              # The filtered list call can miss same-repo PRs in this sandbox; fall back to
+              # a graphql lookup, the same transport the create below uses.
+              existing_pr="$(gh api graphql \
+                -f query='query($owner:String!,$name:String!,$head:String!){repository(owner:$owner,name:$name){pullRequests(states:OPEN,headRefName:$head,first:1){nodes{number}}}}' \
+                -F owner="${GITHUB_REPOSITORY_OWNER}" \
+                -F name="${GITHUB_REPOSITORY#*/}" \
+                -F head="${sync_branch}" \
+                --jq '.data.repository.pullRequests.nodes[0].number // empty')"
+            fi
 
             if [ -n "${existing_pr}" ]; then
               gh pr edit "${existing_pr}" --title "${pr_title}" --body "${pr_body}"

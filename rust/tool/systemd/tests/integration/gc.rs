@@ -305,3 +305,35 @@ fn malformed_generation_outside_limit_disables_gc() -> Result<()> {
 
     Ok(())
 }
+
+/// A malformed newest generation must not consume a configuration-limit slot: the newest
+/// valid generation is installed and garbage collection is disabled by the safeguard.
+#[test]
+fn malformed_newest_generation_does_not_consume_limit_slot() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+    ];
+
+    // Turn the newest generation into a malformed generation without a bootspec.
+    fs::remove_file(generation_links[1].join("boot.json"))?;
+
+    let output = common::Lanzaboote::new()
+        .config_limit(1)
+        .install(esp_mountpoint.path(), generation_links)?;
+    assert!(output.status.success());
+
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
+    refute_file_with_prefix(&uki_dir, "nixos-generation-2");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("Garbage collection is disabled"),
+        "{stderr}"
+    );
+
+    Ok(())
+}

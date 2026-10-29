@@ -142,6 +142,45 @@ fn default_system_prefers_newest_generation() -> Result<()> {
     Ok(())
 }
 
+/// Switching to an older generation that falls outside the configuration limit must still
+/// retain it and make it the default entry, so that the switch actually changes the next
+/// boot.
+#[test]
+fn default_system_outside_limit_is_retained() -> Result<()> {
+    let esp = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let toplevel1 = common::setup_toplevel(tmpdir.path())?;
+    let toplevel2 = common::setup_toplevel(tmpdir.path())?;
+    let toplevel3 = common::setup_toplevel(tmpdir.path())?;
+    let generation_links = [
+        setup_profile_generation_link_from_toplevel(&toplevel1, profiles.path(), None, 1)?,
+        setup_profile_generation_link_from_toplevel(&toplevel2, profiles.path(), None, 2)?,
+        setup_profile_generation_link_from_toplevel(&toplevel3, profiles.path(), None, 3)?,
+    ];
+
+    // Generation 3 is booted, generation 2 is being switched to, the limit keeps only the
+    // newest generation.
+    let output = common::Lanzaboote::new()
+        .config_limit(1)
+        .protected_system(generation_links[2].clone())
+        .default_system(toplevel2.clone())
+        .install(esp.path(), &generation_links)?;
+    assert!(output.status.success());
+
+    let image2 = profile_image_path(&esp, None, 2, &toplevel2)?;
+    assert!(image2.exists(), "{image2:?}");
+    assert_eq!(
+        read_loader_config(&esp),
+        format!(
+            "timeout 0\nconsole-mode 1\ndefault {}\n",
+            file_name(&image2)
+        )
+    );
+
+    Ok(())
+}
+
 /// With boot counting, the default system becomes the preferred entry so that systemd-boot falls
 /// back to the configured default once it has run out of tries.
 #[test]

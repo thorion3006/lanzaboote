@@ -152,20 +152,24 @@ impl<S: Signer> Installer<S> {
             }
         }
 
-        // Parse all generations before applying the configuration limit, so that malformed
-        // generations are recorded even when they would fall outside the limit. Otherwise
-        // garbage collection would delete the installed artifacts of an old malformed
-        // generation instead of being disabled by the broken-generations safeguard.
-        // Generations that survive the limit are parsed again (and recorded again) when
-        // they are installed.
+        // Parse all generations before applying the configuration limit. Malformed
+        // generations are recorded, so that the broken-generations safeguard disables
+        // garbage collection even for generations that fall outside the limit. They are
+        // also excluded from the limit itself, so that a malformed newest generation does
+        // not consume a slot and push the newest valid generation out of the limit.
+        // Generations that survive the limit are parsed again when they are installed.
+        let mut valid_links = BTreeSet::new();
         for link in links.iter() {
-            if Generation::from_link(link).is_err() {
+            if Generation::from_link(link).is_ok() {
+                valid_links.insert(link.clone());
+            } else {
                 self.broken_gens
                     .entry(link.profile.clone())
                     .or_default()
                     .insert(link.version);
             }
         }
+        links = valid_links;
 
         let booted_link = self
             .protected_system
@@ -185,6 +189,13 @@ impl<S: Signer> Installer<S> {
             fs::canonicalize(&p)
                 .inspect_err(|e| log::warn!("Failed to resolve default system {p:?}: {e}"))
                 .ok()
+        });
+
+        let default_link = self.default_system.as_ref().and_then(|default_system| {
+            links
+                .iter()
+                .find(|link| link_provides_toplevel(link, default_system))
+                .cloned()
         });
 
         // With Measured Boot, systemd-pcrlock only supports a limited number of variants, so the
@@ -252,6 +263,35 @@ impl<S: Signer> Installer<S> {
                 links.remove(&oldest);
             }
             links.insert(booted_link);
+        }
+
+        // Like the booted system, the requested default system (the system being switched
+        // to) must be retained even when it falls outside the configuration limit. Without
+        // this, switching to an older generation with a small limit (e.g. Measured Boot's
+        // limit of four) would not change the next boot at all.
+        if let Some(default_link) = default_link
+            && !links.contains(&default_link)
+        {
+            let in_scope = |link: &GenerationLink| {
+                if global_limit {
+                    true
+                } else {
+                    link.profile == default_link.profile
+                }
+            };
+            let oldest = if global_limit {
+                links.iter().min_by_key(|link| link.age_key()).cloned()
+            } else {
+                links.iter().find(|link| in_scope(link)).cloned()
+            };
+            // Only make room if more than one generation remains in the scope of the limit,
+            // so that the booted generation kept above is not evicted again.
+            if let Some(oldest) = oldest
+                && links.iter().filter(|link| in_scope(link)).count() > 1
+            {
+                links.remove(&oldest);
+            }
+            links.insert(default_link);
         }
 
         self.install_generations_from_links(links.iter())?;

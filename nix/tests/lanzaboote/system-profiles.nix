@@ -72,6 +72,9 @@
     let
       system = nodes.machine.system.build.toplevel;
       inherit (nodes.machine.system.build) customSystem;
+      # The stub file names encode the profile name as a SHA-256 hex digest,
+      # like `profile_hash_component` in the Rust tool.
+      customHash = builtins.hashString "sha256" "custom";
     in
     (import ./common/image-helper.nix { inherit (nodes) machine; })
     + ''
@@ -108,7 +111,7 @@
         print(machine.succeed("bootctl list"))
         entry = default_entry()
         t.assertIn("[custom]", entry["title"])
-        t.assertTrue(entry["id"].startswith("nixos-profile-custom-generation-1-"), entry["id"])
+        t.assertTrue(entry["id"].startswith("nixos-profile-${customHash}-generation-1-"), entry["id"])
         check_loader_conf(entry)
 
       with subtest("Boot into the extra system profile"):
@@ -127,7 +130,7 @@
             t.assertEqual(marker(), "custom")
             stubs = machine.succeed("ls -1 /boot/EFI/Linux")
             print(stubs)
-            t.assertRegex(stubs, r"nixos-profile-custom-generation-1-.*\+0-2\.efi")
+            t.assertRegex(stubs, r"nixos-profile-${customHash}-generation-1-.*\+0-2\.efi")
 
             # systemd-boot skips the preferred entry without tries left and uses `default nixos-*`.
             machine.reboot()
@@ -154,13 +157,13 @@
         t.assertEqual(marker(), "system")
 
       with subtest("Garbage collect the deleted profile generation"):
-        t.assertIn("nixos-profile-custom-generation-1-", machine.succeed("ls -1 /boot/EFI/Linux"))
+        t.assertIn("nixos-profile-${customHash}-generation-1-", machine.succeed("ls -1 /boot/EFI/Linux"))
         machine.succeed("rm /nix/var/nix/profiles/system-profiles/custom /nix/var/nix/profiles/system-profiles/custom-1-link")
         machine.succeed("/run/current-system/bin/switch-to-configuration boot")
 
         stubs = machine.succeed("ls -1 /boot/EFI/Linux")
         print(stubs)
-        t.assertNotIn("nixos-profile-custom", stubs)
+        t.assertNotIn("nixos-profile-${customHash}", stubs)
         t.assertTrue(default_entry()["id"].startswith("nixos-generation-2-"))
     '';
 }

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use lanzaboote_tool::architecture::Architecture;
+use lanzaboote_tool::generation::profile_hash_component;
 
 /// Returns the host platform system
 /// in the system double format for
@@ -37,10 +38,9 @@ pub fn setup_generation_link(
     tmpdir: &Path,
     profiles_directory: &Path,
     version: u64,
-    profile: Option<&str>,
 ) -> Result<PathBuf> {
     let toplevel = setup_toplevel(tmpdir).context("Failed to setup toplevel")?;
-    setup_generation_link_from_toplevel(&toplevel, profiles_directory, version, profile)
+    setup_generation_link_from_toplevel(&toplevel, profiles_directory, version)
 }
 
 /// Create a mock generation link.
@@ -51,39 +51,21 @@ pub fn setup_generation_link_from_toplevel(
     toplevel: &Path,
     profiles_directory: &Path,
     version: u64,
-    profile: Option<&str>,
 ) -> Result<PathBuf> {
-    write_generation_link(
-        mock_bootspec(toplevel, toplevel, version),
-        profiles_directory,
-        version,
-        profile,
-    )
+    setup_profile_generation_link_from_toplevel(toplevel, profiles_directory, None, version)
 }
 
-/// Create a mock generation link whose top-level specialisation points at a different
-/// toplevel, like real NixOS specialisations do.
-pub fn setup_generation_link_with_specialisation_toplevel(
+/// Create a mock generation link of a profile.
+///
+/// Works like `setup_generation_link_from_toplevel` but creates the link of any profile other
+/// than the default one inside the system-profiles directory.
+pub fn setup_profile_generation_link_from_toplevel(
     toplevel: &Path,
-    specialisation_toplevel: &Path,
     profiles_directory: &Path,
-    version: u64,
     profile: Option<&str>,
-) -> Result<PathBuf> {
-    write_generation_link(
-        mock_bootspec(toplevel, specialisation_toplevel, version),
-        profiles_directory,
-        version,
-        profile,
-    )
-}
-
-fn mock_bootspec(
-    toplevel: &Path,
-    specialisation_toplevel: &Path,
     version: u64,
-) -> serde_json::Value {
-    json!({
+) -> Result<PathBuf> {
+    let bootspec = json!({
         "org.nixos.bootspec.v1": {
           "init": format!("init-v{}", version),
           // Normally, these are in the Nix store.
@@ -107,47 +89,43 @@ fn mock_bootspec(
             "sort_key": "lanzaboote",
         },
         "org.nixos.specialisation.v1": {
-            "rescue": {
-              "org.nixos.bootspec.v1": {
-                "init": format!("init-v{}", version),
-                // Normally, these are in the Nix store.
-                "initrd": toplevel.join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-6.1.1/initrd"),
-                "kernel": toplevel.join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-6.1.1/kernel"),
-                "kernelParams": [
-                  "amd_iommu=on",
-                  "amd_iommu=pt",
-                  "iommu=pt",
-                  "kvm.ignore_msrs=1",
-                  "kvm.report_ignored_msrs=0",
-                  "udev.log_priority=3",
-                  "systemd.unified_cgroup_hierarchy=1",
-                  "loglevel=4"
-                ],
-                "label": "LanzaOS",
-                "toplevel": specialisation_toplevel,
-                "system": SYSTEM,
-              },
-              "org.nix-community.lanzaboote": {
-                "sort_key": "lanzaboote2",
-              },
-              "org.nixos.specialisation.v1": {
-              },
+          "rescue": {
+            "org.nixos.bootspec.v1": {
+              "init": format!("init-v{}", version),
+              // Normally, these are in the Nix store.
+              "initrd": toplevel.join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-6.1.1/initrd"),
+              "kernel": toplevel.join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-6.1.1/kernel"),
+              "kernelParams": [
+                "amd_iommu=on",
+                "amd_iommu=pt",
+                "iommu=pt",
+                "kvm.ignore_msrs=1",
+                "kvm.report_ignored_msrs=0",
+                "udev.log_priority=3",
+                "systemd.unified_cgroup_hierarchy=1",
+                "loglevel=4"
+              ],
+              "label": "LanzaOS",
+              "toplevel": toplevel.join("specialisation/rescue"),
+              "system": SYSTEM,
             },
+            "org.nix-community.lanzaboote": {
+                "sort_key": "lanzaboote2",
+            },
+            "org.nixos.specialisation.v1": {
+            },
+          },
         },
-    })
-}
-
-fn write_generation_link(
-    bootspec: serde_json::Value,
-    profiles_directory: &Path,
-    version: u64,
-    profile: Option<&str>,
-) -> Result<PathBuf> {
-    let generation_link_path = profiles_directory.join(match profile {
-        Some(profile) => format!("system-profiles/{profile}-{version}-link"),
-        None => format!("system-{version}-link"),
     });
-    fs::create_dir_all(&generation_link_path)?;
+
+    let generation_link_path = if let Some(profile) = profile {
+        let system_profiles = profiles_directory.join("system-profiles");
+        fs::create_dir_all(&system_profiles)?;
+        system_profiles.join(format!("{profile}-{version}-link"))
+    } else {
+        profiles_directory.join(format!("system-{}-link", version))
+    };
+    fs::create_dir(&generation_link_path)?;
 
     let bootspec_path = generation_link_path.join("boot.json");
     let mut file = fs::File::create(bootspec_path)?;
@@ -157,11 +135,6 @@ fn write_generation_link(
     // This has to happen after any modifications to the directory.
     filetime::set_file_mtime(&generation_link_path, filetime::FileTime::zero())?;
     Ok(generation_link_path)
-}
-
-pub fn set_generation_link_mtime(path: &Path, unix_seconds: i64) -> Result<()> {
-    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_seconds, 0))?;
-    Ok(())
 }
 
 /// Setup a mock toplevel inside a temporary directory.
@@ -188,6 +161,7 @@ pub fn setup_toplevel(tmpdir: &Path) -> Result<PathBuf> {
     let kernel_path = fake_store_path.join("kernel");
     let nixos_version_path = toplevel.join("nixos-version");
     let kernel_modules_path = toplevel.join("kernel-modules/lib/modules/6.1.1");
+    let specialisation_path = toplevel.join("specialisation/rescue");
 
     // To simplify the test setup, we use the systemd stub for all PE binaries used by lanzatool.
     // Lanzatool doesn't care whether its actually a kernel or initrd but only whether it can
@@ -197,7 +171,7 @@ pub fn setup_toplevel(tmpdir: &Path) -> Result<PathBuf> {
     fs::copy(&test_systemd_stub, kernel_path)?;
     fs::write(nixos_version_path, b"23.05")?;
     fs::create_dir_all(kernel_modules_path)?;
-    filetime::set_file_mtime(&toplevel, filetime::FileTime::zero())?;
+    fs::create_dir_all(specialisation_path)?;
 
     Ok(toplevel)
 }
@@ -212,15 +186,43 @@ fn random_string(length: usize) -> String {
 
 pub struct Lanzaboote {
     config_limit: u64,
+    bootcounting_initial_tries: u32,
     protected_system: Option<PathBuf>,
+    default_system: Option<PathBuf>,
+    profiles_directory: Option<PathBuf>,
+    pcrlock_directory: Option<PathBuf>,
 }
 
 impl Lanzaboote {
     pub fn new() -> Self {
         Self {
             config_limit: 0,
+            bootcounting_initial_tries: 0,
             protected_system: None,
+            default_system: None,
+            profiles_directory: None,
+            pcrlock_directory: None,
         }
+    }
+
+    pub fn pcrlock_directory(&mut self, pcrlock_directory: PathBuf) -> &mut Self {
+        self.pcrlock_directory = Some(pcrlock_directory);
+        self
+    }
+
+    pub fn profiles_directory(&mut self, profiles_directory: PathBuf) -> &mut Self {
+        self.profiles_directory = Some(profiles_directory);
+        self
+    }
+
+    pub fn bootcounting_initial_tries(&mut self, tries: u32) -> &mut Self {
+        self.bootcounting_initial_tries = tries;
+        self
+    }
+
+    pub fn default_system(&mut self, default_system: PathBuf) -> &mut Self {
+        self.default_system = Some(default_system);
+        self
     }
 
     pub fn config_limit(&mut self, config_limit: u64) -> &mut Self {
@@ -249,7 +251,7 @@ impl Lanzaboote {
         );
 
         let test_loader_config_path = tempfile::NamedTempFile::new()?;
-        let test_loader_config = r"timeout 0\nconsole-mode 1\n";
+        let test_loader_config = "timeout 0\nconsole-mode 1\ndefault nixos-*\n";
         fs::write(test_loader_config_path.path(), test_loader_config)?;
 
         let mut cmd = Command::new(cargo_bin!("lzbt-systemd"));
@@ -260,7 +262,7 @@ impl Lanzaboote {
             .arg("--system")
             .arg(SYSTEM)
             .arg("--systemd")
-            .arg(test_systemd)
+            .arg(&test_systemd)
             .arg("--systemd-boot-loader-config")
             .arg(test_loader_config_path.path())
             .arg("--public-key")
@@ -268,10 +270,27 @@ impl Lanzaboote {
             .arg("--private-key")
             .arg("tests/fixtures/uefi-keys/db.key")
             .arg("--configuration-limit")
-            .arg(self.config_limit.to_string());
+            .arg(self.config_limit.to_string())
+            .arg("--bootcounting-initial-tries")
+            .arg(self.bootcounting_initial_tries.to_string());
 
         if let Some(ref protected_system) = self.protected_system {
             cmd.arg("--protected-system").arg(protected_system);
+        }
+
+        if let Some(ref default_system) = self.default_system {
+            cmd.arg("--default-system").arg(default_system);
+        }
+
+        if let Some(ref profiles_directory) = self.profiles_directory {
+            cmd.arg("--profiles-directory").arg(profiles_directory);
+        }
+
+        if let Some(ref pcrlock_directory) = self.pcrlock_directory {
+            // systemd-pcrlock is looked up on PATH, like the NixOS module arranges it.
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{test_systemd}/lib/systemd:{path}"));
+            cmd.arg("--pcrlock-directory").arg(pcrlock_directory);
         }
 
         let output = cmd.arg(esp_mountpoint).args(generation_links).output()?;
@@ -349,26 +368,14 @@ pub fn count_files(path: &Path) -> Result<usize> {
     Ok(fs::read_dir(path)?.count())
 }
 
-pub fn pe_section<'a>(file_data: &'a [u8], section_name: &str) -> Option<&'a [u8]> {
-    let pe_binary = goblin::pe::PE::parse(file_data).ok()?;
-
-    pe_binary
-        .sections
-        .iter()
-        .find(|s| s.name().unwrap() == section_name)
-        .and_then(|s| {
-            let section_start: usize = s.pointer_to_raw_data.try_into().ok()?;
-            assert!(s.virtual_size <= s.size_of_raw_data);
-            let section_end: usize = section_start + usize::try_from(s.virtual_size).ok()?;
-            Some(&file_data[section_start..section_end])
-        })
+pub fn image_path(esp: &TempDir, version: u64, toplevel: &Path) -> Result<PathBuf> {
+    profile_image_path(esp, None, version, toplevel)
 }
 
-pub fn image_path(
+pub fn profile_image_path(
     esp: &TempDir,
-    version: u64,
     profile: Option<&str>,
-    is_default_profile: bool,
+    version: u64,
     toplevel: &Path,
 ) -> Result<PathBuf> {
     let stub_inputs = [
@@ -386,22 +393,11 @@ pub fn image_path(
         serde_json::to_string(&stub_inputs).unwrap(),
     ));
     let profile_prefix = profile
-        .filter(|_| !is_default_profile)
-        .map(profile_component_for_efi)
-        .map(|profile| format!("nixos-{profile}"))
-        .unwrap_or_else(|| String::from("nixos"));
+        .map(|profile| format!("profile-{}-", profile_hash_component(profile)))
+        .unwrap_or_default();
     Ok(esp.path().join(format!(
-        "EFI/Linux/{profile_prefix}-generation-{version}-{stub_input_hash}.efi"
+        "EFI/Linux/nixos-{profile_prefix}generation-{version}-{stub_input_hash}.efi"
     )))
-}
-
-fn profile_component_for_efi(profile: &str) -> String {
-    let digest = Sha256::digest(profile.as_bytes());
-    let mut component = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        component.push_str(&format!("{byte:02x}"));
-    }
-    component
 }
 
 fn systemd_stub_filename(architecture: &Architecture) -> PathBuf {

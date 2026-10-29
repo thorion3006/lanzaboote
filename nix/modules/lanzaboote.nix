@@ -22,53 +22,37 @@ let
   ]
   ++ cfg.extraEfiSysMountPoints;
 
-  mkInstallCommand = efiSysMountPoint: ''
-        profDir="/nix/var/nix/profiles"
-        set --
+  # Like systemd-boot, make the system that is being switched to the default
+  # boot entry. Only do this if the user has not configured their own default.
+  setDefaultEntry = (cfg.settings.default or null) == "nixos-*" && !(cfg.settings ? preferred);
 
-        for profile in "$profDir"/system-*-link; do
-          if [ -L "$profile" ]; then
-            set -- "$@" "$profile"
-          fi
-        done
-
-        if [ -d "$profDir/system-profiles" ]; then
-          for profile in "$profDir"/system-profiles/*-*-link; do
-            if [ -L "$profile" ]; then
-              set -- "$@" "$profile"
-            fi
-          done
-        fi
-
-        if [ "$#" -eq 0 ]; then
-          ${lib.getExe' pkgs.coreutils "printf"} "%s %s %s\n" \
-            "Failed to find usable system profiles. Please make sure that" \
-            "system profiles are present under $profDir/system-*-link and/or" \
-            "$profDir/system-profiles/<profile-name>-*-link." 1>&2
-          exit 1
-        fi
-
-        PATH=${config.systemd.package}/lib/systemd:$PATH
-        ${cfg.installCommand} \
-    ${lib.concatStringsSep " \\\n" (
-      map (arg: "      " + arg) (
+  mkInstallCommand =
+    efiSysMountPoint:
+    ''
+      PATH=${config.systemd.package}/lib/systemd:$PATH
+      ${cfg.installCommand} \
+    ''
+    + (
+      lib.escapeShellArgs (
         [
-          "--public-key ${lib.escapeShellArg (toString cfg.publicKeyFile)}"
-          "--private-key ${lib.escapeShellArg (toString cfg.privateKeyFile)}"
+          "--public-key=${toString cfg.publicKeyFile}"
+          "--private-key=${toString cfg.privateKeyFile}"
         ]
         ++ lib.optionals (cfg.protectedSystem != null) [
-          "--protected-system ${lib.escapeShellArg cfg.protectedSystem}"
+          "--protected-system=${cfg.protectedSystem}"
         ]
         ++ lib.optionals (cfg.measuredBoot.enable && pcr 4) [
-          "--pcrlock-directory ${lib.escapeShellArg (toString cfg.measuredBoot.pcrlockDirectory)}"
+          "--pcrlock-directory=${cfg.measuredBoot.pcrlockDirectory}"
         ]
         ++ [
-          "${lib.escapeShellArg efiSysMountPoint}"
-          ''"$@"''
+          # lzbt discovers the generations of all system profiles in here.
+          "--profiles-directory=/nix/var/nix/profiles"
+          efiSysMountPoint
         ]
       )
-    )}
-  '';
+      # NixOS passes the toplevel of the system to switch to as first argument.
+      + lib.optionalString setDefaultEntry " \${1:+--default-system=\"$1\"}"
+    );
 
   installHook = pkgs.writeShellScriptBin "lzbt" (
     ''
@@ -136,6 +120,11 @@ in
 
         `null` means no limit i.e. all generations
         that were not garbage collected yet.
+
+        The limit applies to each system profile separately, like with
+        `boot.loader.systemd-boot`. With Measured Boot it applies to the
+        generations of all profiles together, because `systemd-pcrlock` only
+        supports a limited number of variants.
       '';
     };
 
@@ -207,6 +196,16 @@ in
         Configuration for the `systemd-boot`
 
         See `loader.conf(5)` for supported values.
+
+        As long as `default` is `"nixos-*"` and `preferred` is unset, the
+        system that is being switched to becomes the default boot entry (or
+        the preferred one if boot counting is enabled), like with
+        `boot.loader.systemd-boot`. This includes generations of other system
+        profiles, such as those created by `nixos-rebuild --profile-name`.
+
+        Note that `preferred` requires systemd-boot 260 or newer and, unlike
+        `default`, takes precedence over the default entry chosen with
+        `bootctl set-default` or in the boot menu.
       '';
     };
 
@@ -619,8 +618,8 @@ in
           install {PK,KEK,db}.auth ${espMountPoint}/loader/keys/auto/
 
           # Re-sign all the artifacts on the ESP after the new keys have been
-          # auto enrolled.
-          ${installHook}/bin/lzbt
+          # auto enrolled. Keep the running system as the default boot entry.
+          ${installHook}/bin/lzbt /run/current-system
         '';
     };
 
@@ -645,8 +644,9 @@ in
         StateDirectory = "auto-cryptenroll";
         ExecStart = [
           # Re-create all artifacts on the ESP to generate pcrlock measurements
-          # for PCR 4. This will also create a new pcrlock policy.
-          "${installHook}/bin/lzbt"
+          # for PCR 4. This will also create a new pcrlock policy. Keep the
+          # running system as the default boot entry.
+          "${installHook}/bin/lzbt /run/current-system"
           ''
             systemd-cryptenroll \
               --wipe-slot=tpm2 \

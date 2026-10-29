@@ -4,15 +4,14 @@ use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bootspec::BootJson;
 use bootspec::BootSpec;
 use bootspec::SpecialisationName;
 use serde::Deserialize;
-use time::{Month, OffsetDateTime};
-
-pub type GenerationTime = OffsetDateTime;
+use time::Date;
 
 /// (Possibly) extended Bootspec.
 ///
@@ -61,19 +60,16 @@ impl From<bootspec::BootJson> for LanzabooteExtension {
 ///
 /// NixOS represents a generation as a symlink to a toplevel derivation. This toplevel derivation
 /// contains most of the information necessary to install the generation onto the EFI System
-/// Partition. The only information missing is the version number which is encoded in the file name
-/// of the generation link.
+/// Partition. The only information missing is the profile and version number which are encoded in
+/// the path of the generation link.
 #[derive(Debug, Clone)]
 pub struct Generation {
-    /// Profile symlink name
-    pub profile: String,
-    /// Whether this generation comes from the default /nix/var/nix/profiles/system-*-link path.
-    pub is_default_profile: bool,
+    /// Name of the system profile, `None` for the default `system` profile
+    pub profile: Option<String>,
     /// Profile symlink index
     pub version: u64,
-    /// Generation build time, taken from the generation link's timestamp and normalized to the
-    /// earliest link time among all links pointing at the same toplevel.
-    pub build_time: Option<GenerationTime>,
+    /// Build time
+    pub build_time: Option<Date>,
     /// Top-level specialisation name
     pub specialisation_name: Option<SpecialisationName>,
     /// Top-level extended boot specification
@@ -101,9 +97,8 @@ impl Generation {
     ) -> Result<Self> {
         Ok(Self {
             profile: link.profile.clone(),
-            is_default_profile: link.is_default_profile,
             version: link.version,
-            build_time: link.link_time,
+            build_time: link.build_time,
             specialisation_name: Some(specialisation_name),
             spec: ExtendedBootJson {
                 bootspec: specialisation.clone().generation,
@@ -138,9 +133,8 @@ impl Generation {
 
         Ok(Self {
             profile: link.profile.clone(),
-            is_default_profile: link.is_default_profile,
             version: link.version,
-            build_time: link.link_time,
+            build_time: link.build_time,
             specialisation_name,
             spec: ExtendedBootJson {
                 bootspec: bootspec.clone(),
@@ -159,12 +153,15 @@ impl Generation {
         }
     }
 
-    /// Describe the generation profile name for humans.
+    /// Describe the profile of the generation for humans.
+    ///
+    /// Emulates how NixOS's current systemd-boot-builder.py adds the profile to the title. Empty
+    /// for the default profile.
     pub fn describe_profile(&self) -> String {
-        if self.is_default_profile {
-            String::new()
+        if let Some(profile) = &self.profile {
+            format!(" [{profile}]")
         } else {
-            format!(" [{}]", self.profile)
+            "".to_string()
         }
     }
 
@@ -178,7 +175,7 @@ impl Generation {
     pub fn describe(&self) -> String {
         let build_time = self
             .build_time
-            .map(|x| x.date().to_string())
+            .map(|x| x.to_string())
             .unwrap_or_else(|| String::from("Unknown"));
 
         format!(
@@ -190,19 +187,54 @@ impl Generation {
     }
 
     /// A unique short identifier.
+    ///
+    /// Identifiers of the default profile start with the version number, those of other profiles
+    /// with `profile-`, so that the two can never collide.
     pub fn version_tag(&self) -> String {
-        format!("{}{}", self.version, self.describe_specialisation(),)
+        if let Some(profile) = &self.profile {
+            format!(
+                "profile-{}-{}{}",
+                profile,
+                self.version,
+                self.describe_specialisation()
+            )
+        } else {
+            format!("{}{}", self.version, self.describe_specialisation(),)
+        }
     }
 
-    /// Describe the generation with a sortable timestamp for boot menu ordering.
-    pub fn boot_menu_version(&self) -> String {
-        let build_time = self
-            .build_time
-            .map(format_generation_time)
-            .unwrap_or_else(|| String::from("00000000000000"));
-
-        format!("{build_time}-generation-{}", self.version_tag())
+    /// Like `version_tag`, but safe for file names on case-insensitive file systems.
+    ///
+    /// The ESP is formatted with FAT, which is case-insensitive: profile names that differ
+    /// only by case (both pass `is_safe_profile_name`) would produce colliding stub and
+    /// pcrlock measurement file names. Encoding the profile name as a hex digest keeps the
+    /// names unique per profile regardless of the file system's case handling.
+    pub fn hashed_version_tag(&self) -> String {
+        if let Some(profile) = &self.profile {
+            format!(
+                "profile-{}-{}{}",
+                profile_hash_component(profile),
+                self.version,
+                self.describe_specialisation()
+            )
+        } else {
+            self.version_tag()
+        }
     }
+}
+
+/// A collision-free encoding of a profile name for file names on the ESP.
+///
+/// The digest is injective for distinct profile names and consists of lowercase hex only, so
+/// file names built from it cannot collide on case-insensitive file systems and are valid on
+/// the FAT file system used for the ESP.
+pub fn profile_hash_component(profile: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(profile.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl fmt::Display for Generation {
@@ -211,66 +243,45 @@ impl fmt::Display for Generation {
     }
 }
 
-fn read_build_time(path: &Path) -> Result<GenerationTime> {
-    let metadata = fs::symlink_metadata(path)?;
-    let build_time = OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
-    )?;
+fn read_build_time(path: &Path) -> Result<Date> {
+    let build_time =
+        time::OffsetDateTime::from_unix_timestamp(fs::symlink_metadata(path)?.mtime())?.date();
     Ok(build_time)
-}
-
-fn format_generation_time(build_time: GenerationTime) -> String {
-    let (year, month, day) = build_time.to_calendar_date();
-    let clock = build_time.time();
-    format!(
-        "{year:04}{:02}{:02}{:02}{:02}{:02}",
-        month_to_u8(month),
-        day,
-        clock.hour(),
-        clock.minute(),
-        clock.second()
-    )
-}
-
-fn month_to_u8(month: Month) -> u8 {
-    match month {
-        Month::January => 1,
-        Month::February => 2,
-        Month::March => 3,
-        Month::April => 4,
-        Month::May => 5,
-        Month::June => 6,
-        Month::July => 7,
-        Month::August => 8,
-        Month::September => 9,
-        Month::October => 10,
-        Month::November => 11,
-        Month::December => 12,
-    }
 }
 
 /// A link pointing to a generation.
 ///
-/// Can be built from a symlink in /nix/var/nix/profiles/ alone because the name of the
-/// symlink encodes the version number.
+/// Can be built from a symlink in /nix/var/nix/profiles/ alone because the path of the
+/// symlink encodes the profile and version number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationLink {
-    pub profile: String,
-    pub is_default_profile: bool,
+    /// Name of the system profile, `None` for the default `system` profile
+    pub profile: Option<String>,
     pub version: u64,
     pub path: PathBuf,
-    pub link_time: Option<GenerationTime>,
+    pub build_time: Option<Date>,
+    /// Modification time of the link, to compare generations of different profiles
+    pub modified: Option<SystemTime>,
 }
 
 impl GenerationLink {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let (profile, version) =
+            parse_profile_and_version(&path).context("Failed to parse profile and version")?;
         Ok(Self {
-            profile: parse_profile(&path).context("Failed to parse profile name")?,
-            is_default_profile: parse_is_default_profile(&path),
-            version: parse_version(&path).context("Failed to parse version")?,
+            profile,
+            version,
             path: PathBuf::from(path.as_ref()),
-            link_time: read_build_time(path.as_ref()).ok(),
+            build_time: read_build_time(path.as_ref()).ok(),
+            modified: fs::symlink_metadata(path.as_ref())
+                .and_then(|m| m.modified())
+                .ok(),
         })
+    }
+
+    /// Key to order generations of all profiles from oldest to newest.
+    pub fn age_key(&self) -> (Option<SystemTime>, &Option<String>, u64) {
+        (self.modified, &self.profile, self.version)
     }
 }
 
@@ -280,72 +291,99 @@ impl PartialOrd for GenerationLink {
     }
 }
 
-// Ordering must be consistent with the derived `PartialEq`: links from different profiles
-// can share the same version number, and a `BTreeSet` treats `Ordering::Equal` elements as
-// duplicates, so every field has to participate in the comparison. `link_time` is excluded:
-// within a single run, links are distinguished by their path already.
 impl Ord for GenerationLink {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.version
-            .cmp(&other.version)
-            .then_with(|| self.profile.cmp(&other.profile))
-            .then_with(|| self.is_default_profile.cmp(&other.is_default_profile))
-            .then_with(|| self.path.cmp(&other.path))
+        (&self.profile, self.version).cmp(&(&other.profile, other.version))
     }
 }
 
-fn parse_is_default_profile(path: impl AsRef<Path>) -> bool {
-    path.as_ref()
+/// Parse profile name and version number from a path.
+///
+/// Expects a path in the format of "system-{version}-link" for the default profile or
+/// "system-profiles/{profile}-{version}-link" for other profiles. Profile names may contain "-".
+fn parse_profile_and_version(path: impl AsRef<Path>) -> Result<(Option<String>, u64)> {
+    let path = path.as_ref();
+    let (name, version) = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .and_then(|x| x.strip_suffix("-link"))
+        .and_then(|x| x.rsplit_once('-'))
+        .and_then(|(name, version)| Some((name, version.parse::<u64>().ok()?)))
+        .with_context(|| format!("Failed to extract version from: {path:?}"))?;
+
+    let in_system_profiles = path
         .parent()
         .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        != Some("system-profiles")
+        .is_some_and(|x| x == "system-profiles");
+    let profile = if !in_system_profiles {
+        None
+    } else if name.is_empty() {
+        bail!("Failed to extract profile name from: {path:?}");
+    } else if !is_safe_profile_name(name) {
+        // The profile name ends up in file names on the ESP, in loader.conf and in the os-release
+        // of the stub. Refuse anything that could break those before anything is installed.
+        bail!(
+            "Profile name {name:?} of {path:?} contains characters other than ASCII letters, digits, '.', '_' and '-'"
+        );
+    } else {
+        Some(name.to_string())
+    };
+
+    Ok((profile, version))
 }
 
-/// Parse profile name from a path.
-///
-/// Expects a path in the format of "{profile}-{version}-link".
-fn parse_profile(path: impl AsRef<Path>) -> Result<String> {
-    let file_name = path
-        .as_ref()
-        .file_name()
-        .and_then(|x| x.to_str())
-        .with_context(|| format!("Failed to extract file name from: {:?}", path.as_ref()))?;
-
-    let profile_and_version = file_name
-        .strip_suffix("-link")
-        .with_context(|| format!("Generation link is missing '-link' suffix: {file_name:?}"))?;
-
-    let profile = profile_and_version
-        .rsplit_once('-')
-        .map(|(profile, _)| profile)
-        .filter(|profile| !profile.is_empty())
-        .with_context(|| format!("Failed to extract profile name from: {:?}", path.as_ref()))?;
-
-    Ok(profile.to_string())
+/// Whether a profile name can be used safely in ESP file names and loader.conf.
+fn is_safe_profile_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Parse version number from a path.
+/// Whether a file name looks like a generation link, i.e. "{name}-{version}-link".
+fn is_generation_link_name(name: &str) -> bool {
+    name.strip_suffix("-link")
+        .and_then(|x| x.rsplit_once('-'))
+        .is_some_and(|(_, version)| version.parse::<u64>().is_ok())
+}
+
+/// Find the generation links of all system profiles in a profiles directory.
 ///
-/// Expects a path in the format of "{profile}-{version}-link".
-fn parse_version(path: impl AsRef<Path>) -> Result<u64> {
-    let file_name = path
-        .as_ref()
-        .file_name()
-        .and_then(|x| x.to_str())
-        .with_context(|| format!("Failed to extract file name from: {:?}", path.as_ref()))?;
+/// Like NixOS's systemd-boot-builder.py, this returns the links of the default profile
+/// ("{directory}/system-{version}-link") and of all other profiles
+/// ("{directory}/system-profiles/{profile}-{version}-link"). Other entries, e.g. the profile
+/// symlinks themselves or the profiles of nix-env, are ignored. A missing "system-profiles"
+/// directory is not an error.
+pub fn discover_generation_links(directory: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let directory = directory.as_ref();
+    let mut links = list_generation_links(directory, "system-")?;
 
-    let profile_and_version = file_name
-        .strip_suffix("-link")
-        .with_context(|| format!("Generation link is missing '-link' suffix: {file_name:?}"))?;
+    let system_profiles = directory.join("system-profiles");
+    if system_profiles.is_dir() {
+        links.extend(list_generation_links(&system_profiles, "")?);
+    }
 
-    let generation_version = profile_and_version
-        .rsplit_once('-')
-        .map(|(_, version)| version)
-        .and_then(|x| x.parse::<u64>().ok())
-        .with_context(|| format!("Failed to extract version from: {:?}", path.as_ref()))?;
+    Ok(links)
+}
 
-    Ok(generation_version)
+/// List the entries of a directory that look like generation links and start with the prefix.
+fn list_generation_links(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut links = Vec::new();
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("Failed to read profiles directory {directory:?}"))?
+    {
+        let path = entry
+            .with_context(|| format!("Failed to read profiles directory {directory:?}"))?
+            .path();
+        let is_link = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .is_some_and(|name| name.starts_with(prefix) && is_generation_link_name(name));
+        if is_link {
+            links.push(path);
+        } else {
+            log::debug!("Ignoring {path:?}, which is not a generation link.");
+        }
+    }
+    Ok(links)
 }
 
 #[cfg(test)]
@@ -355,44 +393,210 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn parse_profile_correctly() {
+    fn parse_version_correctly() {
         let path = Path::new("system-2-link");
-        let parsed_profile = parse_profile(path).unwrap();
-        assert_eq!(parsed_profile, "system");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (None, 2));
 
-        let path = Path::new("my-2nd-nixos-machine-3-link");
-        let parsed_profile = parse_profile(path).unwrap();
-        assert_eq!(parsed_profile, "my-2nd-nixos-machine");
+        let path = Path::new("/nix/var/nix/profiles/system-12-link");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (None, 12));
     }
 
     #[test]
-    fn parse_version_correctly() {
-        let path = Path::new("system-2-link");
-        let parsed_version = parse_version(path).unwrap();
-        assert_eq!(parsed_version, 2,);
+    fn parse_profile_correctly() {
+        let path = Path::new("/nix/var/nix/profiles/system-profiles/custom-3-link");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (Some("custom".to_string()), 3));
+
+        let path = Path::new("system-profiles/my-host-profile-7-link");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (Some("my-host-profile".to_string()), 7));
+
+        let path = Path::new("system-profiles/system-1-link");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (Some("system".to_string()), 1));
+
+        let path = Path::new("system-profiles/My.Profile_1-2-link");
+        let parsed = parse_profile_and_version(path).unwrap();
+        assert_eq!(parsed, (Some("My.Profile_1".to_string()), 2));
     }
 
-    fn test_link(version: u64, profile: &str) -> GenerationLink {
-        GenerationLink {
-            profile: String::from(profile),
-            is_default_profile: profile == "system",
-            version,
-            path: PathBuf::new(),
-            link_time: None,
+    #[test]
+    fn reject_unsafe_profile_names() {
+        for path in [
+            "system-profiles/my profile-1-link",
+            "system-profiles/my*profile-1-link",
+            "system-profiles/my:profile-1-link",
+            "system-profiles/my\nprofile-1-link",
+            "system-profiles/mäin-1-link",
+        ] {
+            let error = parse_profile_and_version(path).unwrap_err();
+            assert!(
+                error.to_string().contains("contains characters"),
+                "{path} should be rejected because of its characters: {error}"
+            );
         }
     }
 
     #[test]
+    fn discover_generation_links_of_all_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let profiles = directory.path();
+        let system_profiles = profiles.join("system-profiles");
+        fs::create_dir(&system_profiles).unwrap();
+        for name in [
+            // Generation links of the default profile.
+            "system-1-link",
+            "system-12-link",
+            // Everything else in /nix/var/nix/profiles is ignored.
+            "system",
+            "default-3-link",
+            "per-user",
+            // Generation links of other profiles.
+            "system-profiles/custom-1-link",
+            "system-profiles/my-host-profile-7-link",
+            // The profile symlinks themselves and anything else are ignored.
+            "system-profiles/custom",
+            "system-profiles/my-host-profile",
+            "system-profiles/notes.txt",
+        ] {
+            fs::create_dir(profiles.join(name)).unwrap();
+        }
+
+        let mut links = discover_generation_links(profiles).unwrap();
+        links.sort();
+        assert_eq!(
+            links,
+            [
+                "system-1-link",
+                "system-12-link",
+                "system-profiles/custom-1-link",
+                "system-profiles/my-host-profile-7-link",
+            ]
+            .map(|name| profiles.join(name))
+        );
+    }
+
+    #[test]
+    fn discover_generation_links_without_system_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let profiles = directory.path();
+        fs::create_dir(profiles.join("system-1-link")).unwrap();
+
+        let links = discover_generation_links(profiles).unwrap();
+        assert_eq!(links, [profiles.join("system-1-link")]);
+
+        assert!(discover_generation_links(profiles.join("missing")).is_err());
+    }
+
+    #[test]
+    fn parse_malformed_links() {
+        for path in [
+            "system-link",
+            "system-2",
+            "system-x-link",
+            "system--link",
+            "system-profiles/custom",
+            "system-profiles/custom-link",
+            "system-profiles/custom-x-link",
+            "system-profiles/-3-link",
+        ] {
+            assert!(
+                parse_profile_and_version(path).is_err(),
+                "{path} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_hash_component_is_stable() {
+        let component = profile_hash_component("Workstation-1_2.test");
+        assert_eq!(component, profile_hash_component("Workstation-1_2.test"));
+        assert_eq!(component.len(), 64);
+        assert!(
+            component
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn profile_hash_component_distinguishes_case() {
+        // FAT is case-insensitive, so names differing only by case must not share a component.
+        assert_ne!(
+            profile_hash_component("Work"),
+            profile_hash_component("work")
+        );
+    }
+
+    #[test]
     fn generation_link_ordering() {
-        let gen_0 = test_link(0, "system");
-        let gen_1 = test_link(1, "system");
+        let gen_0 = GenerationLink {
+            profile: None,
+            version: 0,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
+        let gen_1 = GenerationLink {
+            profile: None,
+            version: 1,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
         assert!(gen_1 > gen_0)
     }
 
     #[test]
+    fn generation_link_profile_identity() {
+        let system_3 = GenerationLink {
+            profile: None,
+            version: 3,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
+        let custom_3 = GenerationLink {
+            profile: Some("custom".to_string()),
+            version: 3,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
+        let custom_1 = GenerationLink {
+            profile: Some("custom".to_string()),
+            version: 1,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
+
+        // The default profile sorts first, then other profiles by name and version.
+        assert!(system_3 < custom_1);
+        assert!(custom_1 < custom_3);
+
+        let set = BTreeSet::from([system_3, custom_3, custom_1]);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
     fn generation_link_set() {
-        let gen_0 = test_link(0, "system");
-        let gen_1 = test_link(1, "system");
+        let gen_0 = GenerationLink {
+            profile: None,
+            version: 0,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
+        let gen_1 = GenerationLink {
+            profile: None,
+            version: 1,
+            path: PathBuf::new(),
+            build_time: None,
+            modified: None,
+        };
 
         let mut set = BTreeSet::new();
         set.insert(gen_0);
@@ -405,29 +609,5 @@ mod tests {
         let mut reverse = set.iter().rev();
         assert_eq!(reverse.next().unwrap().version, 1);
         assert_eq!(reverse.next().unwrap().version, 0);
-    }
-
-    #[test]
-    fn generation_links_with_same_version_in_different_profiles_are_distinct() {
-        let default = test_link(1, "system");
-        let named = GenerationLink {
-            profile: String::from("system"),
-            is_default_profile: false,
-            path: PathBuf::from("/nix/var/nix/profiles/system-profiles/system-1-link"),
-            ..test_link(1, "system")
-        };
-
-        let mut set = BTreeSet::new();
-        set.insert(default);
-        set.insert(named);
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn reject_malformed_generation_link_names() {
-        for name in ["system-link", "system-abc-link", "2-link", "system-2"] {
-            let path = Path::new(name);
-            assert!(parse_profile(path).is_err() || parse_version(path).is_err());
-        }
     }
 }

@@ -1,4 +1,4 @@
-# gh-aw-metadata: {"schema_version":"v3","frontmatter_hash":"0c185fc1392c6f20b68d4d425d33f5fe3b8c8d6151613e45b90a2cbee4478b1f","strict":true,"agent_id":"claude"}
+# gh-aw-metadata: {"schema_version":"v3","frontmatter_hash":"4e7b248acbe2862bbcb6315e4e73b66c365fc8c2ad79171f830aeee5a0c4f613","strict":true,"agent_id":"claude"}
 #    ___                   _   _      
 #   / _ \                 | | (_)     
 #  | |_| | __ _  ___ _ __ | |_ _  ___ 
@@ -1257,20 +1257,104 @@ jobs:
             exit 0
           fi
 
-          echo "Rebase hit conflicts. Opening or updating a PR instead."
+          echo "Rebase hit conflicts. Trying the held-paths policy before falling back to a PR."
           git rebase --abort || true
 
           # Only (re)create the sync branch when it does not exist yet or still points at
           # an (older) upstream commit. If it carries a manual conflict resolution, the
-          # force-push below would destroy that work.
+          # force-push below would destroy that work. A resolution commit created by the
+          # held-paths policy below is regenerable, and the exact generated commit is
+          # recorded in the ${sync_branch}-generated marker branch. Only a sync branch
+          # whose tip is exactly that marker commit is recreated; any amended or
+          # rewritten resolution differs from the marker and is left untouched.
           remote_sync_sha="$(git ls-remote origin "refs/heads/${sync_branch}" | cut -f1)"
           if [ -n "${remote_sync_sha}" ] && ! git merge-base --is-ancestor "${remote_sync_sha}" "${upstream_sha}"; then
-            echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
-            exit 0
+            git fetch --no-tags origin \
+              "${sync_branch}:${sync_branch}" \
+              "+refs/heads/${sync_branch}-generated:${sync_branch}-generated" >/dev/null 2>&1 || true
+            generated_sha="$(git rev-parse --verify --quiet "${sync_branch}-generated" 2>/dev/null || true)"
+            if [ -z "${generated_sha}" ] || [ "${generated_sha}" != "${remote_sync_sha}" ]; then
+              echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
+              exit 0
+            fi
+            echo "Sync branch ${sync_branch} carries a policy resolution; recreating it on the newer upstream."
           fi
 
-          git checkout -B "${sync_branch}" "${upstream_ref}"
-          git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
+          # While .github/upstream-sync-keep-ours exists, master deliberately holds the
+          # listed paths (adopted from an unmerged upstream PR). If every conflict is
+          # confined to those paths, resolve by keeping the fork side there and taking
+          # upstream everywhere else, so the sync PR is mergeable as-is. Upstream commits
+          # shadowed by keeping our side are listed in the resolution commit message.
+          policy_applied=0
+          keep_ours_file=".github/upstream-sync-keep-ours"
+          if [ -f "${keep_ours_file}" ]; then
+            git checkout -B "${work_branch}" "${origin_ref}"
+            set +e
+            git merge --no-commit --no-ff "${upstream_ref}" >/dev/null 2>&1
+            merge_status=$?
+            set -e
+            conflicted="$(git diff --name-only --diff-filter=U)"
+            if [ "${merge_status}" -eq 0 ] || [ -n "${conflicted}" ]; then
+              outside_conflicts=""
+              while IFS= read -r path; do
+                [ -n "${path}" ] || continue
+                keep=0
+                while IFS= read -r prefix; do
+                  case "${prefix}" in ''|'#'*) continue ;; esac
+                  case "${path}" in "${prefix}"*) keep=1; break ;; esac
+                done < "${keep_ours_file}"
+                if [ "${keep}" -eq 0 ]; then
+                  outside_conflicts="${outside_conflicts}${path}\n"
+                fi
+              done <<< "${conflicted}"
+              if [ -z "${outside_conflicts}" ]; then
+                while IFS= read -r path; do
+                  [ -n "${path}" ] || continue
+                  if git rev-parse -q --verify ":2:${path}" >/dev/null 2>&1; then
+                    git checkout --ours -- "${path}"
+                    git add -- "${path}"
+                  else
+                    # The fork side deleted this file; keeping the fork side means
+                    # keeping the deletion.
+                    git rm -f -- "${path}"
+                  fi
+                done <<< "${conflicted}"
+                git add -A
+                keep_paths="$(grep -v '^#' "${keep_ours_file}" | grep -v '^$' || true)"
+                shadowed=""
+                if [ -n "${keep_paths}" ]; then
+                  shadowed="$(git log --oneline "${origin_sha}..${upstream_sha}" -- ${keep_paths} || true)"
+                fi
+                git commit \
+                  -m "Sync with ${upstream_repo}:${upstream_branch} (keep fork side for held paths)" \
+                  -m "Rebase conflicts were confined to the paths held in ${keep_ours_file} and were resolved by keeping the fork side there; upstream is taken everywhere else." \
+                  -m "Shadowed upstream commits (review these):" \
+                  -m "${shadowed:-None}"
+                git checkout -B "${sync_branch}"
+                policy_applied=1
+                echo "Applied held-paths policy; the sync branch carries the resolved sync."
+              else
+                echo "Conflicts outside the held paths; manual resolution required:"
+                printf '%b' "${outside_conflicts}"
+                git merge --abort || true
+              fi
+            else
+              echo "Merge attempt failed without conflicts; falling back to a manual PR."
+              git merge --abort || true
+            fi
+          fi
+
+          if [ "${policy_applied}" -eq 0 ]; then
+            git checkout -B "${sync_branch}" "${upstream_ref}"
+            git push --force origin "${sync_branch}:refs/heads/${sync_branch}"
+            # No policy resolution this time; drop a stale marker so the guard above
+            # does not treat an unrelated branch head as regenerable.
+            git push origin --delete "${sync_branch}-generated" >/dev/null 2>&1 || true
+          else
+            git push --force origin \
+              "${sync_branch}:refs/heads/${sync_branch}" \
+              "${sync_branch}:refs/heads/${sync_branch}-generated"
+          fi
 
           existing_pr="$(gh pr list \
             --base "${base_branch}" \

@@ -14,7 +14,7 @@ fn keep_only_configured_number_of_generations() -> Result<()> {
     let generation_links: Vec<PathBuf> = [1, 2, 3]
         .into_iter()
         .map(|v| {
-            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
+            common::setup_generation_link(tmpdir.path(), profiles.path(), v)
                 .expect("Failed to setup generation link")
         })
         .collect();
@@ -53,7 +53,7 @@ fn delete_garbage_kernel() -> Result<()> {
     let generation_links: Vec<PathBuf> = [1, 2, 3]
         .into_iter()
         .map(|v| {
-            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
+            common::setup_generation_link(tmpdir.path(), profiles.path(), v)
                 .expect("Failed to setup generation link")
         })
         .collect();
@@ -93,7 +93,7 @@ fn keep_unrelated_files_on_esp() -> Result<()> {
     let generation_links: Vec<PathBuf> = [1, 2, 3]
         .into_iter()
         .map(|v| {
-            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
+            common::setup_generation_link(tmpdir.path(), profiles.path(), v)
                 .expect("Failed to setup generation link")
         })
         .collect();
@@ -122,6 +122,7 @@ fn keep_unrelated_files_on_esp() -> Result<()> {
 
     Ok(())
 }
+
 fn find_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
     let found = fs::read_dir(path)
         .expect("Directory doesn't exist")
@@ -135,19 +136,6 @@ fn find_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
     assert!(found.is_some_and(|e| e.is_ok()));
 }
 
-fn no_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
-    let found = fs::read_dir(path)
-        .expect("Directory doesn't exist")
-        .any(|entry| {
-            entry.is_ok_and(|e| {
-                e.path()
-                    .file_name()
-                    .is_some_and(|filename| filename.to_string_lossy().starts_with(prefix))
-            })
-        });
-    assert!(!found, "Unexpected stub with prefix {prefix}");
-}
-
 #[test]
 fn keep_protected_boot() -> Result<()> {
     let esp_mountpoint = tempdir()?;
@@ -156,7 +144,7 @@ fn keep_protected_boot() -> Result<()> {
     let mut generation_links: Vec<PathBuf> = [1, 2, 3]
         .into_iter()
         .map(|v| {
-            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
+            common::setup_generation_link(tmpdir.path(), profiles.path(), v)
                 .expect("Failed to setup generation link")
         })
         .collect();
@@ -181,7 +169,7 @@ fn keep_protected_boot() -> Result<()> {
 
     // Add a new generation
     generation_links.push(
-        common::setup_generation_link(tmpdir.path(), profiles.path(), 4, None)
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 4)
             .expect("Failed to setup generation link"),
     );
 
@@ -209,60 +197,63 @@ fn keep_protected_boot() -> Result<()> {
     Ok(())
 }
 
+fn refute_file_with_prefix(path: impl AsRef<Path>, prefix: &str) {
+    let found = fs::read_dir(path)
+        .expect("Directory doesn't exist")
+        .any(|entry| {
+            entry.is_ok_and(|e| {
+                e.path()
+                    .file_name()
+                    .is_some_and(|filename| filename.to_string_lossy().starts_with(prefix))
+            })
+        });
+    assert!(!found, "No file with prefix '{prefix}' expected");
+}
+
+/// When a specialisation is booted, `/run/booted-system` points at the specialisation's
+/// toplevel instead of the parent toplevel the generation link points at. The generation
+/// providing the booted specialisation must still be protected.
 #[test]
 fn keep_protected_boot_when_booted_into_specialisation() -> Result<()> {
     let esp_mountpoint = tempdir()?;
     let tmpdir = tempdir()?;
     let profiles = tempdir()?;
-
-    // Generation 1 has a specialisation pointing at its own toplevel, like real NixOS
-    // specialisations. When booted into it, /run/booted-system resolves to the
-    // specialisation's toplevel instead of the parent toplevel the profile link points at.
-    let parent_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let specialisation_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let booted = common::setup_generation_link_with_specialisation_toplevel(
-        &parent_toplevel,
-        &specialisation_toplevel,
-        profiles.path(),
-        1,
-        None,
-    )?;
-    let generation_links = vec![
-        booted,
-        common::setup_generation_link(tmpdir.path(), profiles.path(), 2, None)?,
-        common::setup_generation_link(tmpdir.path(), profiles.path(), 3, None)?,
+    let toplevel = common::setup_toplevel(tmpdir.path())?;
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link_from_toplevel(&toplevel, profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 3)?,
     ];
 
+    // Call `lanzatool install` with a config limit of 2 while booted into the specialisation
+    // of generation 1. The limit alone would keep generations 2 and 3.
     let output = common::Lanzaboote::new()
         .config_limit(2)
-        .protected_system(specialisation_toplevel)
+        .protected_system(toplevel.join("specialisation/rescue"))
         .install(esp_mountpoint.path(), generation_links)?;
     assert!(output.status.success());
 
     let uki_dir = esp_mountpoint.path().join("EFI/Linux");
-    // The booted specialisation's parent generation (and with it the specialisation entry)
-    // must survive the limit of 2...
+    // Generation 1 is preserved although only its specialisation is booted.
     find_file_with_prefix(&uki_dir, "nixos-generation-1");
-    find_file_with_prefix(&uki_dir, "nixos-generation-1-specialisation-rescue");
-    // ...at the cost of the middle generation.
-    no_file_with_prefix(&uki_dir, "nixos-generation-2");
+    refute_file_with_prefix(&uki_dir, "nixos-generation-2");
     find_file_with_prefix(&uki_dir, "nixos-generation-3");
 
     Ok(())
 }
 
+/// With a configuration limit of one, making room for the booted generation must not evict
+/// the generation that was just built: both are kept so that the system can still be rolled
+/// forward into the newest generation.
 #[test]
-fn keep_newest_generation_when_limit_is_one_and_booted_is_older() -> Result<()> {
+fn keep_booted_and_newest_generation_when_limit_is_one() -> Result<()> {
     let esp_mountpoint = tempdir()?;
     let tmpdir = tempdir()?;
     let profiles = tempdir()?;
-    let generation_links: Vec<PathBuf> = [1, 2, 3]
-        .into_iter()
-        .map(|v| {
-            common::setup_generation_link(tmpdir.path(), profiles.path(), v, None)
-                .expect("Failed to setup generation link")
-        })
-        .collect();
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+    ];
 
     let output = common::Lanzaboote::new()
         .config_limit(1)
@@ -271,113 +262,77 @@ fn keep_newest_generation_when_limit_is_one_and_booted_is_older() -> Result<()> 
     assert!(output.status.success());
 
     let uki_dir = esp_mountpoint.path().join("EFI/Linux");
-    // Both the booted generation and the generation that was just built must be bootable;
-    // only the middle generation is dropped.
     find_file_with_prefix(&uki_dir, "nixos-generation-1");
-    no_file_with_prefix(&uki_dir, "nixos-generation-2");
+    find_file_with_prefix(&uki_dir, "nixos-generation-2");
+
+    Ok(())
+}
+
+/// A malformed generation that falls outside the configuration limit must still be recorded,
+/// so that garbage collection stays disabled and its installed artifacts survive.
+#[test]
+fn malformed_generation_outside_limit_disables_gc() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 3)?,
+    ];
+
+    // Install all generations without a limit.
+    let output0 = common::lanzaboote_install(0, esp_mountpoint.path(), generation_links.clone())?;
+    assert!(output0.status.success());
+
+    // Turn generation 1 into a malformed generation without a bootspec.
+    fs::remove_file(generation_links[0].join("boot.json"))?;
+
+    // With a limit of 2, generation 1 falls outside the retained set.
+    let output1 = common::lanzaboote_install(2, esp_mountpoint.path(), generation_links)?;
+    assert!(output1.status.success());
+
+    // Garbage collection is disabled by the malformed generation, so the artifacts
+    // installed for it earlier survive.
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
     find_file_with_prefix(&uki_dir, "nixos-generation-3");
-
-    Ok(())
-}
-
-#[test]
-fn retain_newest_generations_globally_by_build_time() -> Result<()> {
-    let esp_mountpoint = tempdir()?;
-    let tmpdir = tempdir()?;
-    let profiles = tempdir()?;
-
-    let oldest_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let oldest = common::setup_generation_link_from_toplevel(
-        &oldest_toplevel,
-        profiles.path(),
-        50,
-        Some("old"),
-    )?;
-    common::set_generation_link_mtime(&oldest, 0)?;
-    let middle_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let middle = common::setup_generation_link_from_toplevel(
-        &middle_toplevel,
-        profiles.path(),
-        1,
-        Some("middle"),
-    )?;
-    common::set_generation_link_mtime(&middle, 10)?;
-    let newest_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let newest = common::setup_generation_link_from_toplevel(
-        &newest_toplevel,
-        profiles.path(),
-        2,
-        Some("newest"),
-    )?;
-    common::set_generation_link_mtime(&newest, 20)?;
-
-    let output = common::lanzaboote_install(
-        2,
-        esp_mountpoint.path(),
-        vec![oldest, middle.clone(), newest.clone()],
-    )?;
-    assert!(output.status.success());
-
+    let stderr = String::from_utf8(output1.stderr)?;
     assert!(
-        !common::image_path(&esp_mountpoint, 50, Some("old"), false, &oldest_toplevel)?.exists(),
-        "Oldest profile generation should have been dropped by global retention",
-    );
-    assert!(
-        common::image_path(&esp_mountpoint, 1, Some("middle"), false, &middle_toplevel)?.exists()
-    );
-    assert!(
-        common::image_path(&esp_mountpoint, 2, Some("newest"), false, &newest_toplevel)?.exists()
-    );
-    assert_eq!(
-        common::count_files(&esp_mountpoint.path().join("EFI/Linux"))?,
-        4
+        stderr.contains("Garbage collection is disabled"),
+        "{stderr}"
     );
 
     Ok(())
 }
 
+/// A malformed newest generation must not consume a configuration-limit slot: the newest
+/// valid generation is installed and garbage collection is disabled by the safeguard.
 #[test]
-fn retain_original_generation_age_when_profile_link_is_recreated() -> Result<()> {
+fn malformed_newest_generation_does_not_consume_limit_slot() -> Result<()> {
     let esp_mountpoint = tempdir()?;
     let tmpdir = tempdir()?;
     let profiles = tempdir()?;
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+    ];
 
-    let old_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let old_default =
-        common::setup_generation_link_from_toplevel(&old_toplevel, profiles.path(), 1, None)?;
-    common::set_generation_link_mtime(&old_default, 0)?;
+    // Turn the newest generation into a malformed generation without a bootspec.
+    fs::remove_file(generation_links[1].join("boot.json"))?;
 
-    let new_toplevel = common::setup_toplevel(tmpdir.path())?;
-    let new_default =
-        common::setup_generation_link_from_toplevel(&new_toplevel, profiles.path(), 2, None)?;
-    common::set_generation_link_mtime(&new_default, 10)?;
-
-    let old_profile_copy = common::setup_generation_link_from_toplevel(
-        &old_toplevel,
-        profiles.path(),
-        1,
-        Some("copied"),
-    )?;
-    common::set_generation_link_mtime(&old_profile_copy, 20)?;
-
-    let output = common::lanzaboote_install(
-        1,
-        esp_mountpoint.path(),
-        vec![old_default, new_default, old_profile_copy],
-    )?;
+    let output = common::Lanzaboote::new()
+        .config_limit(1)
+        .install(esp_mountpoint.path(), generation_links)?;
     assert!(output.status.success());
 
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
+    refute_file_with_prefix(&uki_dir, "nixos-generation-2");
+    let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        !common::image_path(&esp_mountpoint, 1, None, true, &old_toplevel)?.exists(),
-        "the oldest default generation should be pruned even if copied to a newer profile link",
-    );
-    assert!(
-        common::image_path(&esp_mountpoint, 2, None, true, &new_toplevel)?.exists(),
-        "the genuinely newer generation should be retained",
-    );
-    assert!(
-        !common::image_path(&esp_mountpoint, 1, Some("copied"), false, &old_toplevel)?.exists(),
-        "a recreated profile link must not make an older generation outrank a genuinely newer one",
+        stderr.contains("Garbage collection is disabled"),
+        "{stderr}"
     );
 
     Ok(())

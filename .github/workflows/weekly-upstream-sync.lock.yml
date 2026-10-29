@@ -1262,11 +1262,19 @@ jobs:
 
           # Only (re)create the sync branch when it does not exist yet or still points at
           # an (older) upstream commit. If it carries a manual conflict resolution, the
-          # force-push below would destroy that work.
+          # force-push below would destroy that work. A resolution commit created by the
+          # held-paths policy below is regenerable, so a sync branch whose tip is such a
+          # policy commit is recreated on top of the newer upstream instead of stalling
+          # all later syncs.
           remote_sync_sha="$(git ls-remote origin "refs/heads/${sync_branch}" | cut -f1)"
           if [ -n "${remote_sync_sha}" ] && ! git merge-base --is-ancestor "${remote_sync_sha}" "${upstream_sha}"; then
-            echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
-            exit 0
+            git fetch --no-tags origin "${sync_branch}:${sync_branch}" >/dev/null 2>&1 || true
+            remote_sync_tip="$(git log -1 --format=%s "${remote_sync_sha}" 2>/dev/null || true)"
+            if [ "${remote_sync_tip}" != "Sync with ${upstream_repo}:${upstream_branch} (keep fork side for held paths)" ]; then
+              echo "Sync branch ${sync_branch} carries a manual resolution; leaving it and its PR untouched."
+              exit 0
+            fi
+            echo "Sync branch ${sync_branch} carries a policy resolution; recreating it on the newer upstream."
           fi
 
           # While .github/upstream-sync-keep-ours exists, master deliberately holds the
@@ -1299,8 +1307,14 @@ jobs:
               if [ -z "${outside_conflicts}" ]; then
                 while IFS= read -r path; do
                   [ -n "${path}" ] || continue
-                  git checkout --ours -- "${path}"
-                  git add -- "${path}"
+                  if git rev-parse -q --verify ":2:${path}" >/dev/null 2>&1; then
+                    git checkout --ours -- "${path}"
+                    git add -- "${path}"
+                  else
+                    # The fork side deleted this file; keeping the fork side means
+                    # keeping the deletion.
+                    git rm -f -- "${path}"
+                  fi
                 done <<< "${conflicted}"
                 git add -A
                 keep_paths="$(grep -v '^#' "${keep_ours_file}" | grep -v '^$' || true)"

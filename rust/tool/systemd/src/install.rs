@@ -152,6 +152,21 @@ impl<S: Signer> Installer<S> {
             }
         }
 
+        // Parse all generations before applying the configuration limit, so that malformed
+        // generations are recorded even when they would fall outside the limit. Otherwise
+        // garbage collection would delete the installed artifacts of an old malformed
+        // generation instead of being disabled by the broken-generations safeguard.
+        // Generations that survive the limit are parsed again (and recorded again) when
+        // they are installed.
+        for link in links.iter() {
+            if Generation::from_link(link).is_err() {
+                self.broken_gens
+                    .entry(link.profile.clone())
+                    .or_default()
+                    .insert(link.version);
+            }
+        }
+
         let booted_link = self
             .protected_system
             .as_ref()

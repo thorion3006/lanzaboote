@@ -267,3 +267,41 @@ fn keep_booted_and_newest_generation_when_limit_is_one() -> Result<()> {
 
     Ok(())
 }
+
+/// A malformed generation that falls outside the configuration limit must still be recorded,
+/// so that garbage collection stays disabled and its installed artifacts survive.
+#[test]
+fn malformed_generation_outside_limit_disables_gc() -> Result<()> {
+    let esp_mountpoint = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let generation_links: Vec<PathBuf> = vec![
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 1)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 2)?,
+        common::setup_generation_link(tmpdir.path(), profiles.path(), 3)?,
+    ];
+
+    // Install all generations without a limit.
+    let output0 = common::lanzaboote_install(0, esp_mountpoint.path(), generation_links.clone())?;
+    assert!(output0.status.success());
+
+    // Turn generation 1 into a malformed generation without a bootspec.
+    fs::remove_file(generation_links[0].join("boot.json"))?;
+
+    // With a limit of 2, generation 1 falls outside the retained set.
+    let output1 = common::lanzaboote_install(2, esp_mountpoint.path(), generation_links)?;
+    assert!(output1.status.success());
+
+    // Garbage collection is disabled by the malformed generation, so the artifacts
+    // installed for it earlier survive.
+    let uki_dir = esp_mountpoint.path().join("EFI/Linux");
+    find_file_with_prefix(&uki_dir, "nixos-generation-1");
+    find_file_with_prefix(&uki_dir, "nixos-generation-3");
+    let stderr = String::from_utf8(output1.stderr)?;
+    assert!(
+        stderr.contains("Garbage collection is disabled"),
+        "{stderr}"
+    );
+
+    Ok(())
+}

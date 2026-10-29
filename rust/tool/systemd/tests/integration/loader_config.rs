@@ -181,6 +181,56 @@ fn default_system_outside_limit_is_retained() -> Result<()> {
     Ok(())
 }
 
+/// When both the booted system and the requested default system fall outside the
+/// configuration limit, making room for the default system must not evict the booted
+/// system protected by `protectedSystem`.
+#[test]
+fn default_system_retention_does_not_evict_protected_system() -> Result<()> {
+    let esp = tempdir()?;
+    let tmpdir = tempdir()?;
+    let profiles = tempdir()?;
+    let mut generation_links = Vec::new();
+    for version in 1..=4 {
+        let toplevel = common::setup_toplevel(tmpdir.path())?;
+        let link =
+            setup_profile_generation_link_from_toplevel(&toplevel, profiles.path(), None, version)?;
+        generation_links.push((link, toplevel));
+    }
+
+    // Generation 1 is booted, generation 2 is being switched to, the limit keeps the two
+    // newest generations (3 and 4).
+    let output = common::Lanzaboote::new()
+        .config_limit(2)
+        .protected_system(generation_links[0].0.clone())
+        .default_system(generation_links[1].1.clone())
+        .install(
+            esp.path(),
+            generation_links.iter().map(|(link, _)| link.clone()),
+        )?;
+    assert!(output.status.success());
+
+    let uki_dir = esp.path().join("EFI/Linux");
+    // The protected booted system and the requested default system both survive.
+    assert!(
+        profile_image_path(&esp, None, 1, &generation_links[0].1)?.exists(),
+        "protected generation 1 is missing"
+    );
+    let image2 = profile_image_path(&esp, None, 2, &generation_links[1].1)?;
+    assert!(image2.exists(), "{image2:?}");
+    assert_eq!(
+        read_loader_config(&esp),
+        format!(
+            "timeout 0\nconsole-mode 1\ndefault {}\n",
+            file_name(&image2)
+        )
+    );
+    // Room was made among the unprotected generations.
+    assert!(!profile_image_path(&esp, None, 3, &generation_links[2].1)?.exists());
+    assert!(!profile_image_path(&esp, None, 4, &generation_links[3].1)?.exists());
+
+    Ok(())
+}
+
 /// With boot counting, the default system becomes the preferred entry so that systemd-boot falls
 /// back to the configured default once it has run out of tries.
 #[test]

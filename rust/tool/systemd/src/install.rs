@@ -236,8 +236,8 @@ impl<S: Signer> Installer<S> {
             }
         };
 
-        if let Some(booted_link) = booted_link
-            && !links.contains(&booted_link)
+        if let Some(booted_link) = booted_link.as_ref()
+            && !links.contains(booted_link)
         {
             // Make room by removing the oldest generation, of the same profile unless the limit
             // applies to all profiles together.
@@ -262,7 +262,7 @@ impl<S: Signer> Installer<S> {
             {
                 links.remove(&oldest);
             }
-            links.insert(booted_link);
+            links.insert(booted_link.clone());
         }
 
         // Like the booted system, the requested default system (the system being switched
@@ -279,16 +279,23 @@ impl<S: Signer> Installer<S> {
                     link.profile == default_link.profile
                 }
             };
-            let oldest = if global_limit {
-                links.iter().min_by_key(|link| link.age_key()).cloned()
-            } else {
-                links.iter().find(|link| in_scope(link)).cloned()
+            // Never sacrifice the booted system to make room for the default system: the
+            // booted system is protected by protectedSystem and is the known-working
+            // fallback. If nothing else can be evicted, the retained set is allowed to
+            // exceed the configuration limit.
+            let evictable = |link: &GenerationLink| {
+                in_scope(link) && !booted_link.as_ref().is_some_and(|booted| booted == link)
             };
-            // Only make room if more than one generation remains in the scope of the limit,
-            // so that the booted generation kept above is not evicted again.
-            if let Some(oldest) = oldest
-                && links.iter().filter(|link| in_scope(link)).count() > 1
-            {
+            let oldest = if global_limit {
+                links
+                    .iter()
+                    .filter(|link| evictable(link))
+                    .min_by_key(|link| link.age_key())
+                    .cloned()
+            } else {
+                links.iter().find(|link| evictable(link)).cloned()
+            };
+            if let Some(oldest) = oldest {
                 links.remove(&oldest);
             }
             links.insert(default_link);
